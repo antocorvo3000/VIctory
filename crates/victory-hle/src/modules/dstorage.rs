@@ -142,6 +142,11 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         return from_win32(&error);
     }
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+    if name.contains("core_restofworld")
+        && !super::gameinput::GAME_LOADING.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::info!("the title loads the game: automatic A stops");
+    }
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });

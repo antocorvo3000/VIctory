@@ -1144,7 +1144,16 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
+            let mut pad = convert(&state.Gamepad);
+            // Local build: automatic A/Down go to a connected pad too (the keyboard is no
+            // stand-in pad while one is connected).
+            if super::auto_a() {
+                pad.buttons |= super::A;
+            }
+            if super::auto_down() {
+                pad.buttons |= super::DOWN;
+            }
+            Some(pad)
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1152,6 +1161,12 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
+            if super::auto_a() && !down.contains(&0x0D) {
+                down.push(0x0D);
+            }
+            if super::auto_down() && !down.contains(&0x28) {
+                down.push(0x28);
+            }
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1612,4 +1627,88 @@ mod tests {
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
     }
+
+    #[test]
+    fn auto_a_and_down_follow_mode_and_loading_flag() {
+        assert_eq!(parse_auto_a(None), 0);
+        assert_eq!(parse_auto_a(Some(" 1 ")), 1);
+        assert_eq!(parse_auto_a(Some("2")), 2);
+        assert_eq!(parse_auto_a(Some("0")), 0);
+
+        // Initial 3 s grace period.
+        assert!(!auto_a_at(1, false, 3000));
+        assert!(!auto_down_at(2, 3000));
+
+        // Mode 1: pulses A for 0.3 s every 2 s until GAME_LOADING is set; never presses down.
+        assert!(auto_a_at(1, false, 4000));
+        assert!(auto_a_at(1, false, 4299));
+        assert!(!auto_a_at(1, false, 4300));
+        assert!(!auto_a_at(1, true, 4000));
+        assert!(!auto_down_at(1, 5100));
+
+        // Mode 2: continues after GAME_LOADING and alternates A with D-pad down (4 s cycle).
+        assert!(auto_a_at(2, true, 4000));
+        assert!(!auto_down_at(2, 4000));
+        assert!(auto_down_at(2, 5000));
+        assert!(auto_down_at(2, 5299));
+        assert!(!auto_down_at(2, 5300));
+        assert!(auto_a_at(2, true, 6000));
+        assert!(!auto_down_at(2, 6000));
+    }
+}
+
+/// Local build: set when the title starts loading the game (it opens its world pack).
+pub(crate) static GAME_LOADING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn parse_auto_a(value: Option<&str>) -> u8 {
+    match value.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
+}
+
+fn auto_mode() -> (u8, Option<Instant>) {
+    static STATE: LazyLock<(u8, Option<Instant>)> = LazyLock::new(|| {
+        let mode = parse_auto_a(std::env::var("VICTORY_AUTO_A").ok().as_deref());
+        (mode, (mode != 0).then(Instant::now))
+    });
+    *STATE
+}
+
+fn auto_a_at(mode: u8, loading: bool, ms: u128) -> bool {
+    if mode == 0 || (mode == 1 && loading) {
+        return false;
+    }
+    ms > 3000 && ms % 2000 < 300
+}
+
+fn auto_down_at(mode: u8, ms: u128) -> bool {
+    mode == 2 && ms > 3000 && (1000..1300).contains(&(ms % 4000))
+}
+
+/// Local build: `VICTORY_AUTO_A=1` holds A (the stand-in pad's Enter) for 0.3 s every 2 s,
+/// whether or not the window has focus, until the title loads the game: the profile screen
+/// ("PLAYER A") is passed without anyone at the keyboard. `VICTORY_AUTO_A=2` keeps pressing A
+/// after the game loads (first-run screens).
+fn auto_a() -> bool {
+    let (mode, Some(start)) = auto_mode() else {
+        return false;
+    };
+    auto_a_at(
+        mode,
+        GAME_LOADING.load(std::sync::atomic::Ordering::Relaxed),
+        start.elapsed().as_millis(),
+    )
+}
+
+/// Local build: with `VICTORY_AUTO_A=2`, D-pad down for 0.3 s between every other A (each 4 s:
+/// A, down, A), so a menu whose first item does not advance (the legal notices: "Copyright",
+/// "Photosensitivity", then "Next") is walked down to its button.
+fn auto_down() -> bool {
+    let (mode, Some(start)) = auto_mode() else {
+        return false;
+    };
+    auto_down_at(mode, start.elapsed().as_millis())
 }
