@@ -915,6 +915,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
+        self.trace_dispatch(&p.name, x, y, z);
+        #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
@@ -1168,11 +1170,11 @@ impl State {
         let targets: Vec<String> = self
             .targets
             .iter()
-            .filter_map(|&t| crate::resource::host_resource(t as This))
-            .map(|t| {
+            .filter_map(|&t| {
+                let res = crate::resource::host_resource(t as This)?;
                 // SAFETY: a live resource.
-                let d = unsafe { t.GetDesc() };
-                format!("{}x{} f{}", d.Width, d.Height, d.Format.0)
+                let d = unsafe { res.GetDesc() };
+                Some(format!("{t:#x} {}x{} f{}", d.Width, d.Height, d.Format.0))
             })
             .collect();
         let v = self.vertex[0];
@@ -1192,6 +1194,22 @@ impl State {
         if frame.len() < 256 {
             frame.push(line);
         }
+    }
+
+    /// Dispatches in listed frames, at debug level: their pipeline, shaders,
+    /// and what they read and write (diagnostics builds).
+    #[cfg(feature = "diagnostics")]
+    fn trace_dispatch(&self, shaders: &str, x: u32, y: u32, z: u32) {
+        if !tracing::enabled!(tracing::Level::DEBUG)
+            || !crate::capture::listed(crate::queue::presented() + 1)
+        {
+            return;
+        }
+        tracing::debug!(
+            "dispatch {x}x{y}x{z} pipeline {:#x} {shaders} reads {:?}",
+            self.pipeline,
+            self.reads(true)
+        );
     }
 
     /// In a listed frame: each small buffer (64 bytes at most) the draw's
@@ -1332,6 +1350,15 @@ impl State {
                             None => " slot unknown",
                         });
                         text
+                    }
+                    (RootType::Descriptor, Some(Root::View(address))) => {
+                        let rw = match u.kind {
+                            ResourceType::Uav => "uav",
+                            ResourceType::Srv => "srv",
+                            ResourceType::Cbv => "cbv",
+                            _ => "view",
+                        };
+                        format!("{rw} root {address:#x}")
                     }
                     (root, _) => format!("{root:?}"),
                 };
@@ -1739,18 +1766,33 @@ fn describe(view: Option<&View>) -> String {
     };
     match view {
         None => "no view".into(),
-        Some(v @ View::Shader(r, _)) => texture(*r as This).unwrap_or_else(|| {
-            let range = crate::descriptor::host::buffer_range(v);
-            format!("buffer {range:?}{}", small(range))
-        }),
-        // A buffer has no host texture: its title range, as for a shader view.
-        Some(v @ View::Unordered(r, ..)) => texture(*r as This).map_or_else(
-            || {
-                let range = crate::descriptor::host::buffer_range(v);
-                format!("uav buffer {range:?}{}", small(range))
-            },
-            |t| format!("uav {t}"),
-        ),
+        Some(v @ (View::Shader(r, _) | View::Unordered(r, ..))) => {
+            let kind = if matches!(v, View::Unordered(..)) {
+                "uav"
+            } else {
+                "srv"
+            };
+            match texture(*r as This) {
+                Some(t) => format!("{kind} {r:#x} {t}"),
+                None => {
+                    let range = crate::descriptor::host::buffer_range(v);
+                    match range {
+                        Some((at, len)) => {
+                            format!("{kind} {r:#x} buffer {at:#x}+{len}{}", small(range))
+                        }
+                        None => {
+                            let mem = crate::resource::texture_memory(*r as This)
+                                .map_or(0, |(p, _)| p as u64);
+                            if mem != 0 {
+                                format!("{kind} {r:#x} mem {mem:#x}")
+                            } else {
+                                format!("{kind} {r:#x}")
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Some(View::Placed(u, r, d)) => format!(
             "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
             r[0],
@@ -2442,5 +2484,33 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn describe_includes_kind_and_resource_address() {
+        assert_eq!(describe(None), "no view");
+        assert_eq!(describe(Some(&View::Shader(0, None))), "srv 0x0");
+        assert_eq!(describe(Some(&View::Unordered(0, 0, None))), "uav 0x0");
+
+        let buf = buffer(256);
+        let (addr, _) = crate::resource::buffer_bytes(buf).unwrap();
+        let addr = addr as u64;
+        // Raw buffer SRV and UAV (format R32_TYPELESS=39, dim BUFFER=1, raw flag=1).
+        let srv_words = [39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0];
+        let uav_words = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        let srv = describe(Some(&View::Shader(buf as usize, Some(srv_words))));
+        let uav = describe(Some(&View::Unordered(buf as usize, 0, Some(uav_words))));
+        assert_eq!(srv, format!("srv {:#x} buffer {addr:#x}+256", buf as usize));
+        assert_eq!(uav, format!("uav {:#x} buffer {addr:#x}+256", buf as usize));
+
+        if crate::host::host().is_some() {
+            let mem = title_memory(1 << 20);
+            let tex = texture_at_address(mem, &texture_words(64, 64, 28, 0x105, 4));
+            let tex_srv = describe(Some(&View::Shader(tex as usize, None)));
+            let tex_uav = describe(Some(&View::Unordered(tex as usize, 0, None)));
+            assert!(tex_srv.starts_with(&format!("srv {:#x} 64x64 ", tex as usize)), "{tex_srv}");
+            assert!(tex_uav.starts_with(&format!("uav {:#x} 64x64 ", tex as usize)), "{tex_uav}");
+        }
     }
 }
