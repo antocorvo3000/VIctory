@@ -46,7 +46,9 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
-    let title_dir = exe.parent().unwrap_or(Path::new("."));
+    // Local build: VICTORY_TITLE_DIR names the folder with the title's files when the executable is elsewhere.
+    let title_override = std::env::var_os("VICTORY_TITLE_DIR").map(std::path::PathBuf::from);
+    let title_dir = title_override.as_deref().unwrap_or_else(|| exe.parent().unwrap_or(Path::new(".")));
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();

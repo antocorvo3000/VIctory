@@ -335,18 +335,33 @@ impl Shadow {
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                    // Local build: only the runs of bytes the GPU changed are written, each
+                    // by itself: writing the whole piece put back bytes the title had written
+                    // between our read and our write (lost stores: garbage pointers, crashes).
+                    let mut runs: Vec<(usize, usize)> = Vec::new();
+                    for (k, ((t, h), o)) in title.iter_mut().zip(host.iter_mut()).zip(old).enumerate() {
                         if *h != *o && *t != *h {
                             *t = *h;
-                            changed = true;
+                            match runs.last_mut() {
+                                Some((_, e)) if *e == k => *e = k + 1,
+                                _ => runs.push((k, k + 1)),
+                            }
                         }
                         *h = *t;
                     }
-                    if changed {
+                    if !runs.is_empty() {
                         let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                        let direct = writable(start + at, n);
+                        for (r0, r1) in runs {
+                            let dst = (start + at + r0) as *mut u8;
+                            if direct {
+                                // SAFETY: committed read-write title memory (checked above).
+                                unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r0), dst, r1 - r0) };
+                            } else {
+                                crate::host::write_mapped(dst, title[r0..].as_ptr(), r1 - r0);
+                            }
+                            written += r1 - r0;
+                        }
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -734,4 +749,21 @@ mod tests {
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
         unregister(p, p as u64);
     }
+}
+
+
+/// Local build: whether `[at, at + len)` is committed read-write memory (plain stores work).
+fn writable(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualQuery,
+    };
+    // SAFETY: a query only.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let n = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
+    if unsafe { VirtualQuery(at as *const _, &mut info, n) } == 0 {
+        return false;
+    }
+    info.State == MEM_COMMIT
+        && (info.Protect == PAGE_READWRITE || info.Protect == PAGE_EXECUTE_READWRITE)
+        && info.BaseAddress as usize + info.RegionSize >= at + len
 }
