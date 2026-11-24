@@ -197,7 +197,9 @@ impl Written {
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                 let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
+                let real =
+                    (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64;
+                gpu_clock(real)
             }
             Written::SystemTimestamp => system_timestamp(),
         };
@@ -210,6 +212,50 @@ impl Written {
             }
         }
     }
+}
+
+fn parse_clock_scale(clock: Option<&str>, scale: Option<&str>) -> u64 {
+    if clock.is_some_and(|v| v.trim() == "real") {
+        return 1;
+    }
+    scale
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|&n: &u64| n >= 1)
+        .unwrap_or(16)
+}
+
+fn scale_clock(last: &AtomicU64, real: u64, scale: u64) -> u64 {
+    if scale == 1 {
+        return real;
+    }
+    // Strictly increasing, so two timestamps of one frame never read equal.
+    let want = real / scale;
+    let mut prev = last.load(Ordering::Relaxed);
+    loop {
+        let next = want.max(prev + 1);
+        match last.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(now) => prev = now,
+        }
+    }
+}
+
+/// Local build: the GPU clock titles read. Our GPU work runs on the CPU's timeline (copies,
+/// waits), so the real clock tells Grand Theft Auto VI its GPU takes ~500 ms a frame and its
+/// dynamic resolution drops to the minimum (a pixelated picture). `VICTORY_GPU_CLOCK=scaled`
+/// (default) runs the clock `VICTORY_GPU_CLOCK_SCALE` (default 16) times slower than real time,
+/// so the same work measures 16 times shorter while time still moves forward;
+/// `VICTORY_GPU_CLOCK=real` keeps the real clock.
+fn gpu_clock(real: u64) -> u64 {
+    static SCALE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let scale = *SCALE.get_or_init(|| {
+        parse_clock_scale(
+            std::env::var("VICTORY_GPU_CLOCK").ok().as_deref(),
+            std::env::var("VICTORY_GPU_CLOCK_SCALE").ok().as_deref(),
+        )
+    });
+    scale_clock(&LAST, real, scale)
 }
 
 fn system_timestamp() -> u64 {
@@ -546,5 +592,21 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[test]
+    fn gpu_clock_scales_and_stays_strictly_increasing() {
+        assert_eq!(parse_clock_scale(None, None), 16);
+        assert_eq!(parse_clock_scale(Some("real"), Some("32")), 1);
+        assert_eq!(parse_clock_scale(Some("scaled"), Some("8")), 8);
+        assert_eq!(parse_clock_scale(None, Some("0")), 16);
+        assert_eq!(parse_clock_scale(None, Some("bad")), 16);
+
+        let last = AtomicU64::new(0);
+        assert_eq!(scale_clock(&last, 160, 16), 10);
+        assert_eq!(scale_clock(&last, 160, 16), 11);
+        assert_eq!(scale_clock(&last, 165, 16), 12);
+        assert_eq!(scale_clock(&last, 1600, 16), 100);
+        assert_eq!(scale_clock(&last, 500, 1), 500);
     }
 }

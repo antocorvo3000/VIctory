@@ -32,9 +32,17 @@ use windows::core::{HSTRING, Interface, PCWSTR};
 
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Keeps the pipeline library and the early list in `dir` from now on.
+/// Keeps the pipeline library and the early list in a per-build subfolder of
+/// `dir` from now on, so builds with different translators, root signatures,
+/// or pipeline descriptions never mix `host-pipelines.bin`.
 pub fn use_pipeline_cache(dir: PathBuf) {
+    let dir = build_dir(dir);
+    tracing::info!(dir = %dir.display(), "pipeline cache");
     let _ = DIR.set(dir);
+}
+
+fn build_dir(dir: PathBuf) -> PathBuf {
+    dir.join(format!("build-{}", &tag(&[])[..16]))
 }
 
 /// Host pipelines created, loaded from the library, and title pipelines
@@ -138,6 +146,7 @@ fn tag(blob: &[u8]) -> String {
         translator,
         include_bytes!("../shader_cache.rs"),
         &limit,
+        include_bytes!("../pipeline.rs"),
         include_bytes!("host.rs"),
         include_bytes!("library.rs"),
     ] {
@@ -415,5 +424,14 @@ mod tests {
         // SAFETY: a plain query on a live library.
         assert!(unsafe { library.library.GetSerializedSize() } > 0);
         assert!(library._blob.is_empty());
+    }
+
+    #[test]
+    fn build_dir_scopes_library_per_build_fingerprint() {
+        let dir = build_dir(PathBuf::from("pipelines"));
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("build-"));
+        assert_eq!(name.len(), "build-".len() + 16);
+        assert_eq!(name, format!("build-{}", &tag(&[])[..16]));
     }
 }
