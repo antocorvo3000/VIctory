@@ -12,14 +12,14 @@ decrypts anything or works around any protection, and no game files are included
 | Boot, intro video, start screen, menus | work |
 | Loading into the world | works, no failed DirectStorage reads |
 | The world (prologue) | drawn and lit; characters and hair complete; **picture almost complete once loaded**; cutscenes load much more |
-| Speed in the world | **4.5-5 fps** with the full scene (about 5,000-6,000 draws a frame), peaks of 6-7, Series X mode, no upscaling |
+| Speed in the world | **5-8 fps** depending on the view (5 fps with about 5,500 draws a frame, 8 with about 2,000), Series X mode, no upscaling |
 | Stability | 17 min in the world without a crash or device removal |
 | Memory | about 28 GB committed |
 
-Screenshots from my RX 6800 XT (prologue, Series X mode, 2-3 fps shown in the window title):
+Screenshots from my RX 6800 XT (prologue, Series X mode, no upscaling; frame rate and draws in the window title):
 
-![The cell at sunset, by the window](docs/screenshots/cell-window.png)
-![The cell, sunlight on the wall](docs/screenshots/cell-sink.png)
+![The dormitory: 5 fps, 5,575 draws a frame](docs/screenshots/dorm-bunks.png)
+![Sunlight on the dormitory wall: 8 fps, 2,093 draws a frame](docs/screenshots/dorm-wall.png)
 
 Still wrong: the title's ray-traced light does not run by default yet (`VICTORY_RAYS=1` is experimental), so a
 constant ambient light stands in for it; textures can still pop in late.
