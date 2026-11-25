@@ -4,37 +4,6 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
-#[cfg(any(windows, test))]
-const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
-
-#[cfg(any(windows, test))]
-fn skip_cpu_check(value: Option<&str>) -> bool {
-    value == Some("1")
-}
-
-#[cfg(any(windows, test))]
-fn check_cpu_features_with(has_avx2: bool, skip_env: Option<&str>) -> Result<()> {
-    if has_avx2 || skip_cpu_check(skip_env) {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "this CPU does not support AVX2, which Xbox Series titles require; \
-         set {SKIP_CPU_CHECK_ENV}=1 to bypass this check (for example under CPU emulation such as Intel SDE)"
-    );
-}
-
-/// Pre-flight check before executing title code: Xbox Series binaries are
-/// compiled for Zen 2 and require AVX2.
-#[cfg(windows)]
-fn check_cpu_features() -> Result<()> {
-    #[cfg(target_arch = "x86_64")]
-    let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
-    #[cfg(not(target_arch = "x86_64"))]
-    let has_avx2 = true;
-    let skip = std::env::var(SKIP_CPU_CHECK_ENV).ok();
-    check_cpu_features_with(has_avx2, skip.as_deref())
-}
-
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -42,37 +11,31 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
-) -> Result<u32> {
+) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
-    if execute {
-        check_cpu_features()?;
-    }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
-    // Before the import registry is first used: it holds the module only
-    // when the host's FidelityFX serves.
-    victory_hle::modules::fidelityfx::use_host_dir(cfg.fidelityfx_dir.as_deref());
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    let title_dir = exe.parent().unwrap_or(Path::new("."));
     match victory_game::identify(&hash) {
-        Some(build) => {
-            println!("build          {} ({hash})", build.label);
-            if execute {
-                check_startup_archive(&title_dir.join(build.startup_archive))?;
-            }
-        }
+        Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    // The program is mapped from the copy `load` wrote: the file's bytes
+    // and their patched copy are not read again, and were held for the
+    // whole run (two blocks of 114.7 MB each for the title, in
+    // physical memory: run 65's memory map).
+    drop(prepared);
+    drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(
@@ -86,6 +49,9 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
+    // Local: VICTORY_TITLE_DIR names the folder with the title's files when the executable is elsewhere.
+    let title_override = std::env::var_os("VICTORY_TITLE_DIR").map(std::path::PathBuf::from);
+    let title_dir = title_override.as_deref().unwrap_or_else(|| exe.parent().unwrap_or(Path::new(".")));
     // A missing manifest leaves id 0 and no storage quota.
     let manifest =
         std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
@@ -111,32 +77,6 @@ pub fn run(
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
-    }
-    let imported: Vec<&str> = image
-        .info()
-        .imports
-        .iter()
-        .map(|m| m.dll.as_str())
-        .collect();
-    let mapped: Vec<&str> = dlls.iter().map(|(name, _)| name.as_str()).collect();
-    let absent = absent_title_dlls(&imported, &mapped, &wanted);
-    if !absent.is_empty() {
-        let message = format!(
-            "{} not in {}, and neither the host nor VIctory provides {}: the package is \
-             incomplete; copy every file of the package next to the executable",
-            absent.join(", "),
-            title_dir.display(),
-            if absent.len() == 1 { "it" } else { "them" },
-        );
-        println!("missing dlls   {message}");
-        // None of their imports can be bound, so the title stops at its first
-        // call into one (Grand Theft Auto VI 1.0.2.1 at +0x2237178 during
-        // System Init, #930) with nothing saying why. Stubs only if asked for.
-        if execute && matches!(unimplemented, Unimplemented::Trap) {
-            anyhow::bail!(
-                "the title's own DLLs are missing: {message} (`--unimplemented zero` runs it anyway)"
-            );
-        }
     }
 
     let policy = match unimplemented {
@@ -164,9 +104,11 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    #[cfg(windows)]
+    apply_patches(image.base());
     if !execute {
         println!("not executing (pass --execute to start the title)");
-        return Ok(0);
+        return Ok(());
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
@@ -190,27 +132,6 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
-    Ok(code)
-}
-
-#[cfg(windows)]
-fn check_startup_archive(path: &Path) -> Result<()> {
-    use std::io::Read;
-
-    let mut magic = [0; 4];
-    std::fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut magic))
-        .with_context(|| {
-            format!(
-                "Cannot read startup archive {}. Check that the file from your package is present and readable.",
-                path.display()
-            )
-        })?;
-    anyhow::ensure!(
-        magic == *b"9FPR",
-        "Invalid RPF9 header in {}. Restore the startup archive from your package.",
-        path.display()
-    );
     Ok(())
 }
 
@@ -221,7 +142,8 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     victory_loader::dump_stacks_on_schedule();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
-    poke(image.base(), image.info().size_of_image as usize);
+    upscaler_override(image);
+    ffx_scale(image);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;
@@ -239,6 +161,137 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
             })
             .collect(),
     );
+}
+
+/// Debugging aid: `VICTORY_UPSCALER=<rva>[,<kind>]` (hex rva, decimal kind,
+/// default 7) makes the title's upscaler picker return `kind`. In 1.0.2.1 the
+/// picker is at 7E93F0 and reached by 4 direct calls; it returns 7 (AMD FSR)
+/// only on Series S and 6 (the title's own upscaler) otherwise. The count of
+/// direct calls and jumps to the rva is logged; with none it is the wrong rva
+/// for this executable and nothing is patched.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn upscaler_override(image: &victory_loader::LoadedImage) {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+    let Ok(spec) = std::env::var("VICTORY_UPSCALER") else {
+        return;
+    };
+    let (rva, kind) = spec.split_once(',').unwrap_or((&spec, "7"));
+    let rva = usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16);
+    let (Ok(rva), Ok(kind)) = (rva, kind.trim().parse::<u32>()) else {
+        eprintln!("VIctory: VICTORY_UPSCALER={spec}: expected <hex rva>[,<kind>]");
+        return;
+    };
+    let base = image.base();
+    let mut calls = 0;
+    for s in &image.info().sections {
+        if s.characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
+            continue;
+        }
+        let start = s.rva as usize;
+        // SAFETY: an executable section of the mapped image, readable.
+        let code = unsafe {
+            std::slice::from_raw_parts((base + start) as *const u8, s.virtual_size as usize)
+        };
+        for (i, w) in code.windows(5).enumerate() {
+            let rel = i64::from(i32::from_le_bytes([w[1], w[2], w[3], w[4]]));
+            if matches!(w[0], 0xE8 | 0xE9) && (start + i + 5) as i64 + rel == rva as i64 {
+                calls += 1;
+            }
+        }
+    }
+    if calls == 0 || rva + 6 > image.info().size_of_image as usize {
+        eprintln!(
+            "VIctory: upscaler picker at title+{rva:#x} not patched: no direct call to it (wrong rva?)"
+        );
+        return;
+    }
+    let mut stub = [0xB8, 0, 0, 0, 0, 0xC3]; // mov eax, kind; ret
+    stub[1..5].copy_from_slice(&kind.to_le_bytes());
+    let at = (base + rva) as *mut u8;
+    let mut old = 0;
+    // SAFETY: six bytes at a function entry inside the image; no title code
+    // runs yet.
+    unsafe {
+        VirtualProtect(at.cast(), stub.len(), PAGE_EXECUTE_READWRITE, &mut old);
+        at.copy_from_nonoverlapping(stub.as_ptr(), stub.len());
+        VirtualProtect(at.cast(), stub.len(), old, &mut old);
+    }
+    eprintln!("VIctory: upscaler picker at title+{rva:#x} returns {kind} ({calls} direct calls)");
+}
+
+/// Debugging aid: `VICTORY_FFX_SCALE=<scale>[,<hex rva>]` sets the render
+/// scale of the title's FidelityFX path (0.5: 1080p for a 4K output, 0.6667:
+/// 1440p). The rva is the method that picks the scale (1.0.2.1: 28EF680, the
+/// default); it takes 2/3 on Series S and 1.0 on Series X, so Series X with
+/// FidelityFX forced on renders at full 4K, which overflows its memory plan.
+/// Both of its scale loads (`vmovss xmm0, [rip+d]`) are pointed at our
+/// constant, kept in the padding after the method; with other code there,
+/// nothing is patched.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn ffx_scale(image: &victory_loader::LoadedImage) {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    let Ok(spec) = std::env::var("VICTORY_FFX_SCALE") else {
+        return;
+    };
+    let (scale, rva) = spec.split_once(',').unwrap_or((&spec, "28EF680"));
+    let scale = scale
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|s| *s > 0.0 && *s <= 1.0);
+    let rva = usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16).ok();
+    let (Some(scale), Some(rva)) = (scale, rva) else {
+        eprintln!("VIctory: VICTORY_FFX_SCALE={spec}: expected <scale in (0, 1]>[,<hex rva>]");
+        return;
+    };
+    if rva + FFX_SCALE_SPAN > image.info().size_of_image as usize {
+        eprintln!("VIctory: VICTORY_FFX_SCALE: title+{rva:#x} is outside the image");
+        return;
+    }
+    let at = (image.base() + rva) as *mut u8;
+    let mut old = 0;
+    // SAFETY: the method's first bytes and its padding, inside the mapped
+    // image (checked above); no title code runs yet.
+    let patched = unsafe {
+        VirtualProtect(at.cast(), FFX_SCALE_SPAN, PAGE_EXECUTE_READWRITE, &mut old);
+        let patched = patch_ffx_scale(std::slice::from_raw_parts_mut(at, FFX_SCALE_SPAN), scale);
+        VirtualProtect(at.cast(), FFX_SCALE_SPAN, old, &mut old);
+        patched
+    };
+    if patched {
+        eprintln!("VIctory: FidelityFX render scale at title+{rva:#x} set to {scale}");
+    } else {
+        eprintln!(
+            "VIctory: FidelityFX scale not patched: unexpected code at title+{rva:#x} (wrong rva?)"
+        );
+    }
+}
+
+/// The bytes of the scale method `patch_ffx_scale` reads and writes.
+#[cfg(all(windows, feature = "diagnostics"))]
+const FFX_SCALE_SPAN: usize = 0x68;
+
+/// Points both scale loads of the method `code` starts with
+/// (`vmovss xmm0, [rip+d]` at +0x28 and +0x32) at `scale`, written into the
+/// method's padding at +0x64. False, with nothing written, for other code.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn patch_ffx_scale(code: &mut [u8], scale: f32) -> bool {
+    const LOADS: [usize; 2] = [0x28, 0x32];
+    const SLOT: usize = 0x64;
+    const VMOVSS_RIP: [u8; 4] = [0xC5, 0xFA, 0x10, 0x05];
+    if code.len() < FFX_SCALE_SPAN
+        || LOADS.iter().any(|&l| code[l..l + 4] != VMOVSS_RIP)
+        || code[SLOT..SLOT + 4] != [0xCC; 4]
+    {
+        return false;
+    }
+    code[SLOT..SLOT + 4].copy_from_slice(&scale.to_le_bytes());
+    for l in LOADS {
+        let disp = (SLOT - (l + 8)) as i32;
+        code[l + 4..l + 8].copy_from_slice(&disp.to_le_bytes());
+    }
+    true
 }
 
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each
@@ -269,61 +322,14 @@ fn watch(base: usize, size: usize) {
     });
 }
 
-/// Debugging aid: `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at
-/// each title+rva twice a second. A title that ends itself when its main
-/// loop has not ticked for a while (Grand Theft Auto VI: 30 s) runs on
-/// through slower frames with its tick flag poked. The address must be
-/// writable title data.
-#[cfg(all(windows, feature = "diagnostics"))]
-fn poke(base: usize, size: usize) {
-    let Ok(list) = std::env::var("VICTORY_POKE") else {
-        return;
-    };
-    let hex = |s: &str| usize::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
-    let pokes: Vec<(usize, u8)> = list
-        .split(',')
-        .filter_map(|p| p.split_once(':'))
-        .filter_map(|(rva, byte)| Some((hex(rva)?, u8::try_from(hex(byte)?).ok()?)))
-        .filter(|&(rva, _)| rva < size)
-        .collect();
-    std::thread::spawn(move || {
-        loop {
-            for &(rva, byte) in &pokes {
-                // SAFETY: a byte inside the mapped image, checked above.
-                unsafe { ((base + rva) as *mut u8).write_volatile(byte) };
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-    });
-}
-
 /// DLLs the host or our runtime provide are never taken from the title.
 #[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
 
-/// The DLLs among `imported` (the main image's static imports) that must
-/// come from the title's folder (`wanted`) but were not mapped from it:
-/// none of their imports can be bound. Each named once, case ignored.
-#[cfg(any(windows, test))]
-fn absent_title_dlls(
-    imported: &[&str],
-    mapped: &[&str],
-    wanted: &dyn Fn(&str) -> bool,
-) -> Vec<String> {
-    let mut absent: Vec<String> = Vec::new();
-    for &dll in imported {
-        let known = |list: &[&str]| list.iter().any(|m| m.eq_ignore_ascii_case(dll));
-        if wanted(dll) && !known(mapped) && !absent.iter().any(|a| a.eq_ignore_ascii_case(dll)) {
-            absent.push(dll.to_owned());
-        }
-    }
-    absent
-}
-
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
-/// e.g. Grand Theft Auto VI's upscaler behind its FidelityFX loader.
+/// e.g. The title's upscaler behind its FidelityFX loader.
 #[cfg(windows)]
 struct LateDlls {
     host: victory_hle::HostPolicy,
@@ -446,45 +452,31 @@ impl LoaderLock {
     }
 }
 
-#[cfg(test)]
-mod absent_tests {
-    use super::absent_title_dlls;
-
-    #[test]
-    fn title_dlls_missing_from_the_folder_are_named_once() {
-        // The host provides kernel32, our runtime d3d12_xs; the rest are the
-        // title's own (#930: the four DLLs beside the executable missing).
-        let wanted = |dll: &str| {
-            !["KERNEL32.dll", "d3d12_xs.dll"]
-                .iter()
-                .any(|h| h.eq_ignore_ascii_case(dll))
-        };
-        let imported = [
-            "KERNEL32.dll",
-            "d3d12_xs.dll",
-            "XboxBvhBuilder.dll",
-            "MSVCP140.dll",
-            "Bink2Scarlett.dll",
-            "xboxbvhbuilder.dll",
-        ];
-        let mapped = ["msvcp140.dll"];
-        assert_eq!(
-            absent_title_dlls(&imported, &mapped, &wanted),
-            ["XboxBvhBuilder.dll", "Bink2Scarlett.dll"]
-        );
-    }
-
-    #[test]
-    fn a_complete_package_has_nothing_absent() {
-        let wanted = |dll: &str| dll.starts_with("Title");
-        assert!(absent_title_dlls(&["Title.dll", "Host.dll"], &["TITLE.DLL"], &wanted).is_empty());
-        assert!(absent_title_dlls(&[], &[], &wanted).is_empty());
-    }
-}
-
 #[cfg(all(test, windows))]
 mod tests {
     use std::sync::{Arc, Mutex};
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn ffx_scale_points_both_loads_at_the_constant() {
+        // Synthetic code: the two loads, filler, and int3 padding.
+        let mut code = vec![0x90u8; super::FFX_SCALE_SPAN];
+        for at in [0x28, 0x32] {
+            code[at..at + 8].copy_from_slice(&[0xC5, 0xFA, 0x10, 0x05, 1, 2, 3, 4]);
+        }
+        code[0x60..].fill(0xCC);
+        assert!(super::patch_ffx_scale(&mut code, 0.5));
+        assert_eq!(code[0x64..0x68], 0.5f32.to_le_bytes());
+        // Each load's next instruction plus its displacement is the constant.
+        for at in [0x28, 0x32] {
+            let disp = i32::from_le_bytes(code[at + 4..at + 8].try_into().unwrap());
+            assert_eq!(at as i32 + 8 + disp, 0x64);
+        }
+        // Already patched, so no padding left: nothing is written again.
+        let before = code.clone();
+        assert!(!super::patch_ffx_scale(&mut code, 0.25));
+        assert_eq!(code, before);
+    }
 
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {
@@ -503,48 +495,100 @@ mod tests {
         other.join().unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
     }
-
-    #[test]
-    fn cpu_feature_check_matches_host() {
-        let skip = std::env::var(super::SKIP_CPU_CHECK_ENV).ok();
-        #[cfg(target_arch = "x86_64")]
-        let expected_ok =
-            std::arch::is_x86_feature_detected!("avx2") || skip.as_deref() == Some("1");
-        #[cfg(not(target_arch = "x86_64"))]
-        let expected_ok = true;
-        assert_eq!(super::check_cpu_features().is_ok(), expected_ok);
-    }
-}
-
-#[cfg(test)]
-mod cpu_check_tests {
-    use super::{SKIP_CPU_CHECK_ENV, check_cpu_features_with};
-
-    #[test]
-    fn avx2_present_passes() {
-        assert!(check_cpu_features_with(true, None).is_ok());
-        assert!(check_cpu_features_with(true, Some("0")).is_ok());
-        assert!(check_cpu_features_with(true, Some("1")).is_ok());
-    }
-
-    #[test]
-    fn avx2_missing_fails_with_clear_error() {
-        for skip in [None, Some(""), Some("0"), Some("true")] {
-            let err = check_cpu_features_with(false, skip).unwrap_err();
-            let msg = err.to_string();
-            assert!(msg.contains("AVX2"), "unexpected error: {msg}");
-            assert!(msg.contains("Xbox Series"), "unexpected error: {msg}");
-            assert!(msg.contains(SKIP_CPU_CHECK_ENV), "unexpected error: {msg}");
-        }
-    }
-
-    #[test]
-    fn skip_env_var_bypasses_missing_avx2() {
-        assert!(check_cpu_features_with(false, Some("1")).is_ok());
-    }
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<u32> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
+}
+
+/// Local build (techniques from Palmwave, an XCL fork, for Grand Theft Auto VI 1.0.2.1): patches
+/// of the title's code in memory (the file is never touched), each written only where the bytes
+/// it expects are found, so another build of the title is left alone.
+/// `VICTORY_PATCH=<rva>:<expected hex>=<new hex>;...` adds patches; `VICTORY_PATCH_DEFAULTS=0`
+/// drops the built-in ones (`VICTORY_PATCH_SKIP=<n>,...` drops some of them, by number).
+#[cfg(windows)]
+fn apply_patches(base: usize) {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn VirtualProtect(address: *const core::ffi::c_void, size: usize, protect: u32, old: *mut u32) -> i32;
+    }
+    const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+    // (number, rva, expected, new, what)
+    const DEFAULTS: [(u32, usize, &str, &str, &str); 10] = [
+        (1, 0x2215bdc, "732e", "9090", "hang detector"),
+        (2, 0x2215c70, "7404", "9090", "hang detector"),
+        (3, 0x2215d84, "7404", "9090", "hang detector"),
+        (4, 0x22a3b5, "e8a6f7ffff", "31c0909090", "indirect diffuse / stochastic reflection pass"),
+        (5, 0x22aee6, "e875ecffff", "31c0909090", "indirect diffuse / stochastic reflection pass"),
+        (6, 0x7b4e6a, "8b8944010000", "b90100000090", "world render resolution mode"),
+        (7, 0x25d2fe2, "e819a4ffff", "0f1f440000", "alpha-resolve blur / scattering / ray-marched gather"),
+        (8, 0x327b92e, "7408", "9090", "alpha-resolve blur / scattering / ray-marched gather"),
+        (9, 0x125912d, "e85ef50102", "0f1f440000", "alpha-resolve blur / scattering / ray-marched gather"),
+        (10, 0x5267747, "0f84ae050000", "0f8432050000", "audio lock stop after ~2 minutes"),
+    ];
+    let hex = |s: &str| -> Option<Vec<u8>> {
+        let s = s.trim();
+        (s.len() % 2 == 0).then_some(())?;
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+    };
+    let mut skip: Vec<u32> = std::env::var("VICTORY_PATCH_SKIP")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|n| n.trim().parse().ok())
+        .collect();
+    // Patches 4, 5 and 7-9 switch off the title's lighting passes (indirect
+    // diffuse, scattering, ray-marched gather): with them interiors came out
+    // black (run vu14 against vu15). Only with VICTORY_PATCH_HEAVY=1.
+    // Patch 6 (world render resolution mode) was needed on the old base for
+    // light; on this base it is off unless VICTORY_PATCH_6=1. By default
+    // only the hang detector (1-3: the title ends itself with a write to 0
+    // when frames are slow, kl01 after 9 min) and the audio lock (10).
+    if std::env::var("VICTORY_PATCH_HEAVY").map_or(true, |v| v.trim() != "1") {
+        skip.extend([4, 5, 7, 8, 9]);
+        if std::env::var("VICTORY_PATCH_6").map_or(true, |v| v.trim() != "1") {
+            skip.push(6);
+        }
+    }
+    let mut list: Vec<(String, usize, Vec<u8>, Vec<u8>)> = Vec::new();
+    if std::env::var("VICTORY_PATCH_DEFAULTS").map_or(true, |v| v.trim() != "0") {
+        for (n, rva, old, new, what) in DEFAULTS {
+            if !skip.contains(&n) {
+                list.push((format!("{n} ({what})"), rva, hex(old).unwrap(), hex(new).unwrap()));
+            }
+        }
+    }
+    for entry in std::env::var("VICTORY_PATCH").unwrap_or_default().split(';').filter(|e| !e.trim().is_empty()) {
+        let parsed = (|| {
+            let (rva, rest) = entry.split_once(':')?;
+            let (old, new) = rest.split_once('=')?;
+            let rva = usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16).ok()?;
+            Some((rva, hex(old)?, hex(new)?))
+        })();
+        match parsed {
+            Some((rva, old, new)) if old.len() == new.len() => list.push((entry.trim().to_string(), rva, old, new)),
+            _ => println!("patch          ignored (bad syntax): {entry}"),
+        }
+    }
+    for (name, rva, old, new) in list {
+        let at = base + rva;
+        // SAFETY: an address inside the title's image, which we mapped; read and written
+        // only after checking the expected bytes, with the page made writable for the write.
+        unsafe {
+            let here = std::slice::from_raw_parts(at as *const u8, old.len());
+            if here != old.as_slice() {
+                println!("patch          {name}: not applied (bytes differ: another build?)");
+                continue;
+            }
+            let mut prot = 0u32;
+            if VirtualProtect(at as *const _, new.len(), PAGE_EXECUTE_READWRITE, &mut prot) == 0 {
+                println!("patch          {name}: not applied (page protection)");
+                continue;
+            }
+            std::ptr::copy_nonoverlapping(new.as_ptr(), at as *mut u8, new.len());
+            let mut back = 0u32;
+            VirtualProtect(at as *const _, new.len(), prot, &mut back);
+            println!("patch          {name}: applied at +{rva:#x}");
+        }
+    }
 }

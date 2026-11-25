@@ -1,7 +1,7 @@
 //! The console's DirectStorage (`XCRDAPI.dll`): a factory that opens files
 //! and creates request queues and status arrays the title polls. Its
 //! interfaces have grown since 2020 (new interface ids, new slots); the
-//! slots here are the ones Grand Theft Auto VI calls, read from its call
+//! slots here are the ones the title calls, read from its call
 //! sites. Slots nobody has needed yet log their offset.
 //!
 //! Submitted requests of every queue run on one pool of workers, as the
@@ -28,10 +28,11 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use victory_formats::bcpack::{self, Tables};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
+use super::xmem::PageRuns;
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
 use crate::{HleModule, hle_export};
 
-/// The factory interface Grand Theft Auto VI asks for.
+/// The factory interface the title asks for.
 const FACTORY: Guid = Guid::new(
     0x6295_9d11,
     0xd45f,
@@ -141,10 +142,12 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
         return from_win32(&error);
     }
+    let kept = name.clone();
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
 
@@ -171,7 +174,7 @@ extern "system" fn create_status_array(
 }
 
 /// The queue's description: as in 2020 (source type, capacity, priority,
-/// name), plus a field Grand Theft Auto VI sets to 1.
+/// name), plus a field the title sets to 1.
 #[repr(C)]
 struct QueueDesc {
     source_type: u64,
@@ -216,7 +219,7 @@ extern "system" fn create_queue(
     )
 }
 
-/// Grand Theft Auto VI asks for 32 MiB and stops if this fails.
+/// The title asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
@@ -289,7 +292,7 @@ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
         .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire))
 }
 
-/// Grand Theft Auto VI polls this (entry 0, a `Sleep(1)` loop) and never
+/// The title polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
 extern "system" fn is_complete(this: Array, index: u32) -> bool {
     status_result(this, index) != E_PENDING
@@ -355,8 +358,6 @@ struct Lanes {
     refused: u64,
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
-    /// Requests into physical pages.
-    pages: u64,
     since: Option<std::time::Instant>,
 }
 
@@ -370,7 +371,7 @@ struct Lane {
     unsubmitted: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    reads: VecDeque<(u64, Request, Option<PageRuns>)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -387,6 +388,8 @@ struct Job {
     lane: u64,
     seq: u64,
     request: Request,
+    /// The destination's pages, resolved before the request ran.
+    pages: Option<PageRuns>,
     staging: u64,
 }
 
@@ -414,7 +417,6 @@ fn scheduler() -> Option<&'static Scheduler> {
                     done: Default::default(),
                     refused: 0,
                     bcpack: Default::default(),
-                    pages: 0,
                     since: None,
                 }),
                 work: Condvar::new(),
@@ -443,6 +445,52 @@ impl Scheduler {
     }
 }
 
+/// The walls trace (`VICTORY_WALLS_TRACE`): 0 or unset: off; 1: a line for
+/// every read request that fails, with its file; 2: for every request (the
+/// list of a launch's reads, by file and offset, is what a launch with the
+/// first room's walls and one without are compared by).
+fn walls_trace() -> u8 {
+    static ON: OnceLock<u8> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_WALLS_TRACE").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0)
+    })
+}
+
+/// The files opened, by the address of our file object, with their paths
+/// (for the walls trace: a request names its file by that address).
+static WALLS_FILES: Mutex<Vec<(usize, String)>> = Mutex::new(Vec::new());
+
+/// The walls trace's line for a request that is done.
+fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::time::Instant) {
+    let level = walls_trace();
+    if level == 0 || (level == 1 && result.is_ok()) {
+        return;
+    }
+    let file = if request.options & MEMORY_SOURCE != 0 {
+        "memory".to_string()
+    } else {
+        let files = WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        let source = request.source as usize;
+        files.iter().find(|f| f.0 == source).map_or_else(|| "?".to_string(), |f| f.1.clone())
+    };
+    let hr = match result {
+        Ok(()) => 0,
+        Err(hr) => *hr as u32,
+    };
+    tracing::info!(
+        file,
+        offset = request.offset,
+        source_size = request.source_size,
+        destination_size = request.destination_size,
+        to_pages = request.options & PAGE_DESTINATION != 0,
+        options = format_args!("{:#x}", request.options),
+        ms = started.elapsed().as_millis() as u64,
+        ok = result.is_ok(),
+        hr = format_args!("{hr:#010x}"),
+        "walls trace: a read request is done"
+    );
+}
+
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
@@ -453,7 +501,8 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = execute(&job.request, job.pages.as_ref());
+        walls_request(&job.request, &result, started);
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -475,9 +524,6 @@ impl Lanes {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
-        if job.request.options & PAGE_DESTINATION != 0 {
-            self.pages += 1;
-        }
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
         if elapsed.as_secs() >= 5 {
@@ -491,7 +537,6 @@ impl Lanes {
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
-                page_destinations = std::mem::take(&mut self.pages),
                 waiting,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
@@ -513,14 +558,13 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let staging = staging_bytes(&lane.reads.front()?.1);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, request, pages) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -532,6 +576,7 @@ impl Lanes {
             lane: id,
             seq,
             request,
+            pages,
             staging,
         })
     }
@@ -571,7 +616,12 @@ impl Lanes {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(request, mut pages) => {
+                    if pages.is_none() && page_list() == PageList::Submit {
+                        pages = resolve(&request, "submit");
+                    }
+                    lane.reads.push_back((seq, request, pages));
+                }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
@@ -674,7 +724,7 @@ struct Request {
     source_size: u32,
     /// Compressed size between two decompression stages; unused here.
     intermediate_size: u32,
-    /// Matched by cancellation; Grand Theft Auto VI leaves it 0.
+    /// Matched by cancellation; the title leaves it 0.
     tag: u64,
     name: *const c_char,
 }
@@ -687,13 +737,81 @@ const BCPACK: u64 = 0xf << 1;
 const PAGE_DESTINATION: u64 = 1 << 21;
 const MEMORY_SOURCE: u64 = 1 << 22;
 // Bits 5-20 select a further transform, bit 23 a source in physical pages;
-// Grand Theft Auto VI's packages need neither, so requests with them fail.
+// The title's packages need neither, so requests with them fail.
 
 const PAGE: usize = 64 * 1024;
 
 enum Command {
-    Read(Request),
+    /// A read, with its destination pages if already resolved.
+    Read(Request, Option<PageRuns>),
     Status(Status),
+}
+
+impl Command {
+    fn has_page_list(&self) -> bool {
+        matches!(self, Command::Read(r, _) if r.options & PAGE_DESTINATION != 0)
+    }
+}
+
+/// When a page destination's list is read (`VICTORY_PAGE_LIST`). The
+/// title passes a pointer into its live table of physical pages: it
+/// enqueues, then maps the pages (which fills the table in), then submits,
+/// and may change the table afterwards. So the list is right at the
+/// title's submit (`submit`, the default); `enqueue` reads it as the
+/// request comes in, `late` when a worker runs it (and lets a half-full
+/// queue submit on its own as before), to compare.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PageList {
+    Enqueue,
+    Submit,
+    Late,
+}
+
+fn page_list() -> PageList {
+    static MODE: OnceLock<PageList> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_PAGE_LIST").as_deref() {
+            Ok("enqueue") => PageList::Enqueue,
+            Ok("late") => PageList::Late,
+            _ => PageList::Submit,
+        };
+        tracing::info!(?mode, "dstorage: page lists read at");
+        mode
+    })
+}
+
+/// A page destination's list resolved to memory now; `None` (read again
+/// when the request runs) for other requests, or if a page is unknown yet.
+fn resolve(request: &Request, at: &str) -> Option<PageRuns> {
+    if request.options & PAGE_DESTINATION == 0 || request.destination.is_null() {
+        return None;
+    }
+    let (offset, len) = destination_span(request);
+    // SAFETY: the title passes a page number per 64 KiB of destination.
+    let pages = unsafe {
+        std::slice::from_raw_parts(request.destination.cast::<usize>(), (offset + len).div_ceil(PAGE))
+    };
+    let runs = super::xmem::resolve_pages(pages, offset, len);
+    if runs.is_none() {
+        tracing::debug!(
+            at,
+            first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
+            pages = pages.len(),
+            "dstorage: page list not resolved; read again when the request runs"
+        );
+    }
+    runs
+}
+
+/// Where in the first page a page destination starts, and how many bytes
+/// the request writes.
+fn destination_span(request: &Request) -> (usize, usize) {
+    let len = if request.options & (ZLIB | BCPACK) == 0 {
+        request.source_size
+    } else {
+        request.destination_size
+    };
+    ((request.page_offset & 0xffff) as usize, len as usize)
 }
 
 
@@ -721,7 +839,12 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
-    queue(this, Command::Read(request));
+    let pages = if page_list() == PageList::Enqueue {
+        resolve(&request, "enqueue")
+    } else {
+        None
+    };
+    queue(this, Command::Read(request, pages));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
@@ -739,7 +862,9 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
 }
 
 /// Adds a command to the queue; blocks while the queue is full, and
-/// submits on its own once half of it is enqueued, as the console does.
+/// submits on its own once half of it is enqueued, as the console does,
+/// unless page-destination requests wait in it (their lists are only right
+/// at the title's submit): then only a full queue submits on its own.
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
@@ -755,6 +880,15 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        if !lane.unsubmitted.is_empty() {
+            tracing::warn!(
+                commands = lane.unsubmitted.len(),
+                "dstorage: a full queue submits before the title does"
+            );
+            lanes.submit(id);
+            scheduler.work.notify_all();
+            continue;
+        }
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -764,7 +898,8 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    let hold = page_list() != PageList::Late && lane.unsubmitted.iter().any(Command::has_page_list);
+    if !hold && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
         lanes.submit(id);
         scheduler.work.notify_all();
     }
@@ -785,14 +920,14 @@ extern "system" fn submit(this: QueueRef) {
 
 /// Ends the queue whatever its reference count: what was not started never
 /// completes, and this returns once the reads already running have
-/// finished. Grand Theft Auto VI calls this, not `Release`.
+/// finished. The title calls this, not `Release`.
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(request: &Request, pages: Option<&PageRuns>) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -821,8 +956,25 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        // A file read into a title address is the kernel's write, and the
+        // kernel does not fault into the GPU side's guard: a block guarded
+        // again between `kernel_will_write` and the read (the guard over all
+        // the views of a page protects other views from other threads) made
+        // the read fail with ERROR_INVALID_USER_BUFFER, and the title stops
+        // at the failed request (runs amd-C and amd-C2, seconds after the
+        // world's first frame). It is read beside and copied in: our copy
+        // faults into the guard like the title's own writes.
+        let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
+        return into_destination(request, pages, size, |out| {
+            if !bounce {
+                return read_into(request, out).map(|()| size);
+            }
+            let mut data = vec![0; size];
+            read_into(request, &mut data)?;
+            out.copy_from_slice(&data);
+            Ok(size)
+        })
+        .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
@@ -835,7 +987,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
+    into_destination(request, pages, size, |out| match tables {
         Some(tables) => bcpack::decode(bc, &source, out, tables)
             .map(|()| out.len())
             .map_err(|e| fail(INVALID_DATA, &e.to_string())),
@@ -854,11 +1006,47 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 /// that ends short of `out` passes: the title's chunks fill it exactly, and
 /// nothing says that is required.
 fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
-    miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
-        .map_err(|status| {
-            tracing::debug!(?status, "dstorage: zlib stream");
-            INVALID_DATA
-        })
+    thread_local! {
+        static INFLATE: std::cell::RefCell<zlib_rs::Inflate> =
+            std::cell::RefCell::new(zlib_rs::Inflate::new(true, 15));
+    }
+    INFLATE.with_borrow_mut(|state| {
+        state.reset(true);
+        // `Inflate::decompress` cannot distinguish a valid empty stream from
+        // an insufficient buffer when `avail_out == 0`, so use a 1-byte scratch
+        // destination and verify `written <= out_len` afterward.
+        let out_len = out.len();
+        let mut scratch = [0u8; 1];
+        let dest = if out_len == 0 { &mut scratch[..] } else { out };
+        let (mut in_pos, mut out_pos) = (0usize, 0usize);
+        let status = loop {
+            match state.decompress(
+                &source[in_pos..],
+                &mut dest[out_pos..],
+                zlib_rs::InflateFlush::NoFlush,
+            ) {
+                Ok(zlib_rs::Status::StreamEnd) => break Ok(zlib_rs::Status::StreamEnd),
+                Ok(zlib_rs::Status::Ok) => {
+                    let next_in = state.total_in() as usize;
+                    let next_out = state.total_out() as usize;
+                    if next_in == in_pos && next_out == out_pos {
+                        break Ok(zlib_rs::Status::BufError);
+                    }
+                    in_pos = next_in;
+                    out_pos = next_out;
+                }
+                other => break other,
+            }
+        };
+        let written = state.total_out() as usize;
+        match status {
+            Ok(zlib_rs::Status::StreamEnd) if written <= out_len => Ok(written),
+            other => {
+                tracing::debug!(?other, "dstorage: zlib stream");
+                Err(INVALID_DATA)
+            }
+        }
+    })
 }
 
 /// The BCPack format's constant tables, parsed once for the process. If
@@ -949,81 +1137,129 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
 /// physical pages are too when they are consecutive pages of one
-/// allocation, and otherwise go through a buffer.
+/// allocation, and otherwise go through a buffer. `pages` is the page
+/// list resolved earlier; without it the list is read now.
 fn into_destination(
     request: &Request,
+    pages: Option<&PageRuns>,
     len: usize,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        let _writing = victory_gpu::kernel_will_write(request.destination as usize, len);
+        // Opens the guarded blocks and tells the GPU side a placed texture
+        // there changes. `fill` writes from user mode (a file read is read
+        // beside first, see `execute`), so a block guarded again meanwhile
+        // faults into the guard instead of failing the write.
+        victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let filled = fill(out).map(drop);
+        // Said again now that the bytes are there (upstream's c75fdba holds
+        // the blocks open over the read and marks them once more at its
+        // end): a copy or a texture pass that took the memory while the
+        // read was under way took what was there before. Counted; acted on
+        // only with `VICTORY_PAGE_WRITES=all`.
+        victory_gpu::title_memory_written(request.destination as usize, len, false);
+        return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
+    let late;
+    let runs = match pages {
+        Some(runs) => Some(runs),
+        None => {
+            // SAFETY: the title passes a page number per 64 KiB of
+            // destination, which holds at least `len` bytes from `offset`.
+            let pages = unsafe {
+                std::slice::from_raw_parts(
+                    request.destination.cast::<usize>(),
+                    (offset + len).div_ceil(PAGE),
+                )
+            };
+            late = super::xmem::resolve_pages(pages, offset, len);
+            late.as_ref()
+        }
     };
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+    if let Some(runs) = runs
+        && let Some(mut window) = runs.window()
+    {
+        let filled = fill(window.bytes()).map(drop);
+        drop(window);
+        // The title maps pages where the card reads them and has them
+        // filled afterwards: the GPU side's copies of those addresses
+        // learn of the bytes only from this (upstream c75fdba, fork PR
+        // #571). After a decode that failed part way too: what it wrote
+        // is there.
+        runs.written(len);
+        return filled;
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
-        return Ok(());
+    // A page the title has just made, or a view the host refuses for a
+    // moment, comes right a little later: the write is tried again before
+    // the request fails (`VICTORY_DSTORAGE_RETRIES`, 12 tries, about 0.9 s
+    // in all; 0: not tried again, as before). Runs 175-178 lost 12 to 446
+    // reads a launch here, all in one second of the loading; the one build
+    // that tried again (run 165) lost none of 13.
+    static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let retries = *RETRIES.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12)
+    });
+    // Since the start: writes that succeeded on a later try, and writes
+    // given up.
+    static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    let write = || runs.is_some_and(|runs| runs.write(&data[..n]));
+    let mut written = write();
+    let mut tries = 0u32;
+    while !written && runs.is_some() && tries < retries {
+        std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
+        tries += 1;
+        written = write();
     }
-    // Page number 0 is no page (numbers start at 0x10_0000): a list naming
-    // it is one the title has not filled yet. The title writes a request's
-    // page list after enqueueing it, and a queue half full is submitted on
-    // its own, so a read can start first. Read the list again for a few
-    // milliseconds before failing: the title never looks at a request's
-    // result, so a failed one is a model or texture left unwritten.
-    if pages.contains(&0) {
-        for _ in 0..LATE_LIST_TRIES {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            // SAFETY: as above; the title's list, read again.
-            let again = unsafe {
-                std::slice::from_raw_parts(request.destination.cast::<usize>(), pages.len())
-            };
-            if !again.contains(&0) && super::xmem::write_physical(again, offset, &data[..n]) {
-                let late = LATE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
-                if late.is_power_of_two() {
-                    tracing::info!(
-                        late,
-                        "dstorage: a page list filled after its request started: written late"
-                    );
-                }
-                return Ok(());
-            }
+    if written {
+        if tries > 0 {
+            let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(
+                offset,
+                len,
+                tries,
+                on_a_retry,
+                given_up = RETRIED[1].load(Ordering::Relaxed),
+                "dstorage: a destination's physical pages written after a retry"
+            );
         }
+        // As above, after the write that succeeded.
+        if let Some(runs) = runs {
+            runs.written(n);
+        }
+        Ok(())
+    } else {
+        let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            known = runs.is_some(),
+            last_error = std::io::Error::last_os_error().raw_os_error(),
+            tries,
+            given_up,
+            on_a_retry = RETRIED[0].load(Ordering::Relaxed),
+            "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
+        );
+        // Said aloud: the title never reads a request's result
+        // (it only polls for completion), so a destination left unwritten
+        // is a model or texture that silently holds whatever its pages
+        // held before.
+        tracing::warn!(
+            offset,
+            len,
+            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+        );
+        Err(E_INVALIDARG)
     }
-    tracing::warn!(
-        offset,
-        len,
-        pages = pages.len(),
-        "dstorage: a destination's physical pages could not be written; its request fails"
-    );
-    Err(E_INVALIDARG)
 }
 
-/// Milliseconds a page list naming page 0 is read again for.
-const LATE_LIST_TRIES: u32 = 8;
-/// Page lists filled after their request started (written late).
-static LATE_LISTS: AtomicU32 = AtomicU32::new(0);
-
-/// Slots by the 2020 order, which the argument shapes at Grand Theft Auto
-/// VI's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
+/// Slots by the 2020 order, which the argument shapes at
+/// the title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
 static QUEUE_VTABLE: Methods<12> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<Queue> as *const (),
@@ -1185,10 +1421,18 @@ mod tests {
         assert_eq!(std::mem::offset_of!(QueueDesc, unknown), 0x18);
     }
 
+    fn compress_zlib(plain: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; zlib_rs::compress_bound(plain.len())];
+        let (packed, rc) =
+            zlib_rs::compress_slice(&mut buf, plain, zlib_rs::DeflateConfig::new(6));
+        assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+        packed.to_vec()
+    }
+
     #[test]
     fn raw_and_zlib_reads_from_a_file() {
         let plain = pattern(300_000);
-        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        let packed = compress_zlib(&plain);
         let mut contents = plain.clone();
         contents.extend_from_slice(&packed);
         let (_dir, file) = file_with(&contents);
@@ -1220,7 +1464,7 @@ mod tests {
     #[test]
     fn memory_sources_inflate_too() {
         let plain = pattern(70_000);
-        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        let packed = compress_zlib(&plain);
         let (queue, array) = (new_queue(1), status_array(1));
         let mut out = vec![0u8; plain.len()];
         let options = ZLIB | MEMORY_SOURCE;
@@ -1308,7 +1552,6 @@ mod tests {
             done: Default::default(),
             refused: 0,
             bcpack: Default::default(),
-            pages: 0,
             since: None,
         }
     }
@@ -1317,7 +1560,7 @@ mod tests {
         let mut r = request(options, std::ptr::null_mut(), 0, std::ptr::null(), 0, 0);
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
-        lane.unsubmitted.push(Command::Read(r));
+        lane.unsubmitted.push(Command::Read(r, None));
     }
 
     #[test]
@@ -1398,7 +1641,7 @@ mod tests {
     #[test]
     fn zlib_then_bcpack() {
         with_test_tables();
-        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&BC4_STREAM, 6);
+        let packed = compress_zlib(&BC4_STREAM);
         let (_dir, file) = file_with(&packed);
         let (queue, array) = (new_queue(0), status_array(1));
         let mut out = [0u8; 16];
@@ -1527,29 +1770,31 @@ mod tests {
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
         assert_eq!(seen, plain);
     }
+
     #[test]
-    fn a_page_list_filled_after_its_request_starts() {
+    fn page_lists_are_read_at_the_titles_submit() {
         use crate::modules::xmem;
-        let (mut given, mut page) = (1usize, [0usize; 1]);
+        let mut real = [0usize; 1];
+        let mut n = 1;
         assert_eq!(
-            xmem::XMemAllocatePhysicalPages(0, &mut given, page.as_mut_ptr()),
+            xmem::XMemAllocatePhysicalPages(0, &mut n, real.as_mut_ptr()),
             1
         );
-        let mapped = xmem::XMemVirtualAlloc(
-            std::ptr::null_mut(),
-            PAGE,
-            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
-            0,
-            0x04,
-        );
-        assert!(!mapped.is_null());
-        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
-
-        // The title's list, still empty when the request is submitted.
-        let list = Box::leak(Box::new([0usize; 1]));
-        let at = std::ptr::from_mut(list) as usize;
-        let plain = pattern(4096);
-        let (queue, array) = (new_queue(1), status_array(1));
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 1,
+            capacity: 4,
+            priority: 1,
+            name: c"pages".as_ptr(),
+            unknown: 1,
+        };
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        let plain = pattern(100);
+        // Enqueued before the title maps its pages: the list is empty yet.
+        let mut list = [0usize; 1];
+        let array = status_array(1);
         let r = request(
             PAGE_DESTINATION | MEMORY_SOURCE,
             list.as_mut_ptr().cast(),
@@ -1558,21 +1803,22 @@ mod tests {
             0,
             plain.len(),
         );
-        let number = page[0];
-        let filler = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            // SAFETY: the leaked list, alive for the whole test.
-            unsafe { std::ptr::write_volatile(at as *mut usize, number) };
-        });
         enqueue(queue, &r);
-        enqueue_status(queue, array, 0);
+        enqueue_status(queue, array, 0); // half the queue: held for the submit
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(result(array, 0), E_PENDING);
+        list[0] = real[0];
         void(queue, 0x30);
+        list[0] = 0; // the title reuses its table after the submit
         assert_eq!(wait(array, 0), S_OK);
-        filler.join().unwrap();
+        let mapped =
+            xmem::XMemVirtualAlloc(std::ptr::null_mut(), PAGE, 0x2000 | 0x2040_0000, 0, 0x04);
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, real.as_ptr()), mapped);
         // SAFETY: the page is mapped read-write.
-        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), plain.len()) };
+        let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), 100) };
         assert_eq!(seen, plain);
     }
+
     #[test]
     fn zlib_into_pages_in_place_and_across_allocations() {
         use crate::modules::xmem;
@@ -1586,7 +1832,7 @@ mod tests {
         };
         let (a, b) = (allocate(3), allocate(1));
         let plain = pattern(2 * PAGE + 100);
-        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        let packed = compress_zlib(&plain);
         // One allocation's pages in order (one window), then pages of two
         // (through a buffer), both from 50 bytes into the first.
         let mut destinations = [a.clone(), vec![a[0], a[1], b[0]]];
@@ -1630,5 +1876,62 @@ mod tests {
         }
         assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn zlib_inflate_handles_short_exact_empty_and_bad_streams() {
+        let plain = pattern(65_537);
+        let packed = compress_zlib(&plain);
+
+        // Exact fit.
+        let mut exact = vec![0u8; plain.len()];
+        assert_eq!(inflate(&packed, &mut exact), Ok(plain.len()));
+        assert_eq!(exact, plain);
+
+        // Short stream into a larger buffer passes and returns bytes written;
+        // guard bytes outside the slice passed to `inflate` stay untouched.
+        let mut larger = vec![0xAA; plain.len() + 64];
+        assert_eq!(
+            inflate(&packed, &mut larger[..plain.len() + 32]),
+            Ok(plain.len())
+        );
+        assert_eq!(&larger[..plain.len()], &plain[..]);
+        assert!(larger[plain.len() + 32..].iter().all(|&b| b == 0xAA));
+
+        // Empty valid stream passes for empty or non-empty destinations.
+        let empty = compress_zlib(&[]);
+        assert_eq!(inflate(&empty, &mut []), Ok(0));
+        let mut scratch = [0x55u8; 4];
+        assert_eq!(inflate(&empty, &mut scratch), Ok(0));
+
+        // Oversized stream (destination too small, including empty) fails.
+        let mut small = vec![0u8; plain.len() - 1];
+        assert_eq!(inflate(&packed, &mut small), Err(INVALID_DATA));
+        assert_eq!(inflate(&packed, &mut []), Err(INVALID_DATA));
+
+        // Truncated stream (missing trailer or payload bytes) fails.
+        let mut out = vec![0u8; plain.len()];
+        assert_eq!(
+            inflate(&packed[..packed.len() - 1], &mut out),
+            Err(INVALID_DATA)
+        );
+        assert_eq!(
+            inflate(&packed[..packed.len() / 2], &mut out),
+            Err(INVALID_DATA)
+        );
+        assert_eq!(inflate(&[], &mut out), Err(INVALID_DATA));
+
+        // Corrupt Adler-32 trailer fails.
+        let mut bad_adler = packed.clone();
+        *bad_adler.last_mut().unwrap() ^= 1;
+        assert_eq!(inflate(&bad_adler, &mut out), Err(INVALID_DATA));
+
+        // Corrupt header/payload fails, and subsequent valid inflate on the
+        // same thread still succeeds (verifies thread-local state reset).
+        let mut bad_body = packed.clone();
+        bad_body[2] ^= 0xFF;
+        assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
+        assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
+        assert_eq!(out, plain);
     }
 }

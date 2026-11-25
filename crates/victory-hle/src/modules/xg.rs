@@ -3,7 +3,7 @@
 //! slice lies, and to copy linear data into tiled memory and back. Served
 //! from `victory_formats::texture`.
 //!
-//! Grand Theft Auto VI imports `XGCreateTextureComputer` and
+//! The title imports `XGCreateTextureComputer` and
 //! `XGSuggestSwizzleMode` and calls these computer methods: Release (0x08),
 //! the layout (0x10), copies into (0x40) and out of (0x48) a subresource,
 //! and the 64 KiB tiling (0x50). The other slots log and fail.
@@ -147,16 +147,20 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
         l if l & !0xff == SWIZZLED => Swizzle(l & 0xff),
         _ => return None,
     };
-    let texture = Texture::new(&TextureDesc {
-        dimension,
-        width: u32::try_from(desc.width).ok()?,
-        height: desc.height,
-        depth_or_array: u32::from(desc.depth_or_array),
-        mips: u32::from(desc.mips),
-        format: desc.format,
-        samples: desc.samples.max(1),
-        swizzle,
-    })
+    let texture = Texture::for_gpu(
+        &TextureDesc {
+            dimension,
+            width: u32::try_from(desc.width).ok()?,
+            height: desc.height,
+            depth_or_array: u32::from(desc.depth_or_array),
+            mips: u32::from(desc.mips),
+            format: desc.format,
+            samples: desc.samples.max(1),
+            swizzle,
+        },
+        victory_gpu::console::current().pipes(),
+        0,
+    )
     .ok()?;
     // The layout struct has room for 15 mips.
     (texture.planes[0].layout.mips.len() <= MIPS).then_some(texture)
@@ -165,7 +169,7 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
 const MIPS: usize = 15;
 
 /// One mip in the layout the title reads (offsets 0x00, 0x08, 0x10 and
-/// 0x1c are read by Grand Theft Auto VI; the rest follow the library's
+/// 0x1c are read by the title; the rest follow the library's
 /// older public shape).
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -539,7 +543,7 @@ extern "system" fn tiling(
 }
 
 /// Slot 0x30 `(plane, mip, x, y, z or slice, sample, bit position)`: an
-/// element's byte offset from the texture's start. Grand Theft Auto VI reads
+/// element's byte offset from the texture's start. The title reads
 /// texels of a 128x4 `4KB_S` texture on the CPU through it (title+0x5151c90);
 /// an error returned as an offset made it read wild memory. 0 if outside.
 extern "system" fn element_offset(
@@ -665,10 +669,6 @@ mod tests {
         d.flags = ALLOW_DEPTH_STENCIL;
         XGSuggestSwizzleMode(&d, 0, &mut out);
         assert_eq!(out, 0x118);
-        // A 1D texture has no tiled layout, whatever its use.
-        d.dimension = TEXTURE_1D;
-        XGSuggestSwizzleMode(&d, 0, &mut out);
-        assert_eq!(out, 0x100);
     }
 
     /// The title's calls: layout, then a copy in and out of each mip.

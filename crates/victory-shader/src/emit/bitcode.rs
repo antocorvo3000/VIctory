@@ -7,14 +7,30 @@
 
 use std::collections::HashMap;
 
+pub mod census;
+pub mod opt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
+
+/// What the lowering made an instruction for, where it says so (counted by
+/// [`census`], nothing else reads it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tag {
+    /// The select that keeps a register's old value in lanes a guard masks.
+    Guard,
+    /// An index clamp the translation adds (the console has none).
+    Clamp,
+    /// The iteration counter and limit test the translation adds to a loop.
+    Counter,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TypeDef {
     Void,
     Int(u32),
     Float,
+    Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
     Struct(Option<String>, Vec<Ty>),
@@ -208,9 +224,8 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
-    /// Structures chosen between by a condition: `(cond, other)` by the
-    /// one taken where `cond` holds. [`Module::extract`] chooses the field.
-    pub chosen: HashMap<V, (V, V)>,
+    /// See [`Tag`]: by instruction.
+    tags: HashMap<u32, Tag>,
 }
 
 impl Module {
@@ -232,6 +247,9 @@ impl Module {
     }
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
+    }
+    pub fn double(&mut self) -> Ty {
+        self.ty(TypeDef::Double)
     }
     pub fn ptr(&mut self, to: Ty) -> Ty {
         self.ty(TypeDef::Ptr(to, 0))
@@ -358,6 +376,16 @@ impl Module {
         g
     }
 
+    /// Notes what instruction `v` is for (see [`Tag`]); only when modules
+    /// are counted.
+    pub fn tag(&mut self, v: V, tag: Tag) {
+        if let V::Inst(i) = v
+            && census::enabled()
+        {
+            self.tags.insert(i, tag);
+        }
+    }
+
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1
@@ -409,14 +437,7 @@ impl Module {
             TypeDef::Array(_, t) => *t,
             t => panic!("extractvalue from {t:?}"),
         };
-        let x = self.push(block, ty, Op::Extract(agg, index));
-        match self.chosen.get(&agg).copied() {
-            Some((cond, other)) => {
-                let y = self.push(block, ty, Op::Extract(other, index));
-                self.select(block, cond, x, y)
-            }
-            None => x,
-        }
+        self.push(block, ty, Op::Extract(agg, index))
     }
     pub fn call(&mut self, block: usize, f: V, args: Vec<V>) -> V {
         let V::Func(i) = f else {
@@ -548,9 +569,21 @@ impl Module {
             }
             w.record(3, &r);
         }
+        // 5 (`VICTORY_DENORM`): the entry's float mode, `"fp32-denorm-mode"="<mode>"`
+        let groups = if let Some(mode) = denorm_mode() {
+            let mut r = vec![5, 0xFFFF_FFFF, 4];
+            r.extend(b"fp32-denorm-mode".iter().map(|&c| u64::from(c)));
+            r.push(0);
+            r.extend(mode.bytes().map(u64::from));
+            r.push(0);
+            w.record(3, &r);
+            5
+        } else {
+            4
+        };
         w.exit();
         w.enter(PARAMATTR_BLOCK, 3);
-        for id in 1..=4 {
+        for id in 1..=groups {
             w.record(2, &[id]);
         }
         w.exit();
@@ -561,6 +594,7 @@ impl Module {
             match t {
                 TypeDef::Void => w.record(2, &[]),
                 TypeDef::Float => w.record(3, &[]),
+                TypeDef::Double => w.record(4, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
                 TypeDef::Array(n, e) => w.record(11, &[u64::from(*n), u64::from(e.0)]),
@@ -615,7 +649,11 @@ impl Module {
         for f in &self.funcs {
             // [type, cc, isproto, linkage, paramattr, align, section,
             // visibility, gc, unnamed_addr, prologue, dllstorage, comdat, prefix]
-            let attr = f.attr.map_or(0, |a| a as u64);
+            let attr = match f.attr {
+                Some(a) => a as u64,
+                None if f.body && denorm_mode().is_some() => 5,
+                None => 0,
+            };
             w.record(
                 8,
                 &[
@@ -705,7 +743,7 @@ impl Module {
             let blk = &self.blocks[b];
             if let (Some(Term::Br(h)), true, [p]) = (
                 blk.term,
-                blk.phis.iter().all(|&i| !live[i as usize]) && blk.body.is_empty(),
+                blk.phis.is_empty() && blk.body.is_empty(),
                 &preds[b][..],
             ) && pos[h] < pos[b]
                 && !succs(*p).contains(&h)
@@ -876,6 +914,19 @@ impl Module {
 }
 
 const MODULE_BLOCK: u64 = 8;
+/// The entry function's `fp32-denorm-mode` that `VICTORY_DENORM` names (`ftz`, `preserve`,
+/// `any`); none by default, which leaves it to the host. (`ftz` made a triangle-edge pattern on
+/// AMD: something the title computes needs its denormals.)
+pub fn denorm_mode() -> Option<&'static str> {
+    static MODE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    MODE.get_or_init(|| {
+        std::env::var("VICTORY_DENORM")
+            .ok()
+            .filter(|v| matches!(v.as_str(), "any" | "preserve" | "ftz"))
+    })
+    .as_deref()
+}
+
 const PARAMATTR_BLOCK: u64 = 9;
 const PARAMATTR_GROUP_BLOCK: u64 = 10;
 const CONSTANTS_BLOCK: u64 = 11;
@@ -1172,45 +1223,6 @@ mod tests {
         assert!(live[ids(read)] && live[ids(sum)]);
         assert!(!live[ids(unread)] && !live[ids(cyc_a)] && !live[ids(cyc_b)]);
         assert_eq!(live, live_by_passes(&m));
-    }
-
-    #[test]
-    fn empty_latch_with_dead_phis_is_folded() {
-        // Two identical loops except one has an unread phi in its empty latch;
-        // both must fold the latch and emit identical bitcode.
-        let build = |with_dead_phi: bool| {
-            let mut m = Module::default();
-            let i32t = m.int(32);
-            let void = m.void();
-            let fty = m.func_ty(void, vec![i32t]);
-            let f = m.function("sink", fty, Some(Attr::NoUnwind), false);
-            let main_ty = m.func_ty(void, vec![]);
-            m.function("main", main_ty, None, true);
-            let (entry, head, body, latch, exit) = (
-                m.new_block(),
-                m.new_block(),
-                m.new_block(),
-                m.new_block(),
-                m.new_block(),
-            );
-            let (z, one, ten) = (m.i32(0), m.i32(1), m.i32(10));
-            m.terminate(entry, Term::Br(head));
-            let i = m.phi(head, i32t);
-            m.terminate(head, Term::Br(body));
-            let next = m.bin(body, Bin::Add, i, one);
-            let cond = m.cmp(body, pred::IULT, next, ten);
-            m.terminate(body, Term::CondBr(cond, latch, exit));
-            if with_dead_phi {
-                let dead = m.phi(latch, i32t);
-                m.set_phi(dead, vec![(next, body)]);
-            }
-            m.terminate(latch, Term::Br(head));
-            m.set_phi(i, vec![(z, entry), (next, latch)]);
-            let _ = m.call(exit, f, vec![next]);
-            m.terminate(exit, Term::Ret);
-            m.write()
-        };
-        assert_eq!(build(false), build(true));
     }
 
     #[test]

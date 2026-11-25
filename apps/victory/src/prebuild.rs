@@ -1,22 +1,39 @@
-//! The pipeline pre-build, the warm-up's second half: every pipeline of the
-//! title's shader pack made ahead of a run into the host pipeline library
-//! the run reads (`<cache>/pipelines`), so that a first run, and a first
-//! visit to any place, compiles nothing the pack lists.
+//! The pipeline pre-build (`victory translate --cache --pipelines`): every
+//! pipeline of the title's shader pack made ahead of a run into the shader
+//! cache and host pipeline library the run reads (`<cache>/shaders`,
+//! `<cache>/pipelines`), so that a run compiles nothing the pack lists.
+//! Ported from upstream 9c58a1c onto this tree's pipeline library.
 //!
 //! Each pack record becomes the creation stream the engine would hand the
-//! device for that pipeline (`victory_game::pipelines`), which goes through
-//! the run's own code (`victory_gpu::pipeline::Prebuild`): a pipeline is
-//! only ever used if its host description is the run's, byte for byte.
-//! Records whose states cannot be named, or whose shaders are refused, are
-//! counted by cause and skipped. The library is saved as it grows: an
-//! interrupted pre-build keeps its work, and the next one finds those
-//! pipelines there.
+//! device (`victory_game::pipelines`), which goes through the run's own
+//! code (`victory_gpu::pipeline::Prebuild`): the host pipeline gets the
+//! name a run gives it. Run it with the same executable and the same
+//! translation switches as the game: the shader cache is keyed by both.
+//!
+//! - `VICTORY_SKIP_PIPELINES` (and the built-in list) is honoured as in a run.
+//! - Resumable: the library is saved every [`SAVE_EVERY`] pipelines made
+//!   (and every minute), and the keys it then holds are listed in
+//!   `prebuilt-pipelines.txt` beside it (valid while the library file is
+//!   at least the size on its first line: a run only adds to it); a next
+//!   pre-build skips those.
+//! - After each save the library is opened again from its file: a library
+//!   holds every pipeline stored into it, and the host driver died after
+//!   about 1,900 of them in one process (`amdxc64.dll`, RX 9070 XT).
+//! - Each pipeline is printed (and flushed) before its host pipeline is
+//!   made: if the host driver dies, the last lines name the culprit's shader
+//!   hashes, for `VICTORY_SKIP_PIPELINES` (`--jobs 1` makes it the last one).
+//! - The pipelines being made are also listed in `prebuild-inflight.txt`:
+//!   after a crash, the next pre-build makes those first, one at a time; one
+//!   that was made alone when the driver died goes to `prebuild-crashed.txt`
+//!   and is skipped from then on. Running the pre-build again until it ends
+//!   goes past every pipeline that kills the driver.
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use victory_game::pipelines::{self, Named, Unnamed};
@@ -36,22 +53,36 @@ enum Job {
     Compute(usize),
 }
 
-pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
+const LIBRARY_FILE: &str = "host-pipelines.bin";
+const LIST_FILE: &str = "prebuilt-pipelines.txt";
+/// The keys being made (left behind by a crash).
+const INFLIGHT_FILE: &str = "prebuild-inflight.txt";
+/// The keys the host driver died on, made alone: skipped.
+const CRASHED_FILE: &str = "prebuild-crashed.txt";
+/// Pipelines made between two saves of the library, at most.
+const SAVE_EVERY: usize = 200;
+
+pub fn run(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
+    let paths = crate::default_paths(paths)?;
+    let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let started = Instant::now();
-    pipeline::use_pipeline_cache(victory_core::Config::load()?.cache_subdir("pipelines")?);
-    // The files that hold shaders (or the pack itself).
+    let cfg = victory_core::Config::load()?;
+    let shaders_dir = cfg.cache_subdir("shaders")?;
+    let dir = shaders_dir.with_file_name("pipelines");
+    // On a fresh cache the folder only appears when the library is first saved;
+    // without it the crash-tracking files below cannot be written and a crashed
+    // pre-build never resumes.
+    std::fs::create_dir_all(&dir)?;
+    // As a run: translations in `shaders`, the library in `pipelines`.
+    victory_hle::modules::d3d12x::use_shader_cache(shaders_dir);
+    println!("cache        {}", dir.display());
     let files: Vec<(PathBuf, Vec<u8>)> = paths
         .iter()
-        .flat_map(|root| {
-            walkdir::WalkDir::new(root)
-                .into_iter()
-                .filter_map(Result::ok)
-        })
+        .flat_map(|root| walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok))
         .filter(|e| e.file_type().is_file() && e.metadata().is_ok_and(|m| m.len() <= MAX_FILE))
         .filter_map(|e| Some((e.path().to_owned(), std::fs::read(e.path()).ok()?)))
         .filter(|(_, d)| d.starts_with(shaderpack::MAGIC) || !sources(d).is_empty())
         .collect();
-    // It ships beside the shader databases.
     let found = (files.iter())
         .filter(|(_, d)| d.starts_with(shaderpack::MAGIC) || sgd5::is_sgd5(d))
         .find_map(|(p, d)| Some((p, shaderpack::find(d)?)));
@@ -75,9 +106,7 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(source) = list.get(i) else { break };
-                        let Some(bytes) = source.bytes() else {
-                            continue;
-                        };
+                        let Some(bytes) = source.bytes() else { continue };
                         for (id, stage) in program_ids(&bytes) {
                             lock(&programs).entry(id).or_insert((f, i, stage));
                         }
@@ -87,8 +116,7 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         });
     }
     let programs = programs.into_inner().unwrap_or_else(|e| e.into_inner());
-    let databases: Vec<sgd5::Database> =
-        files.iter().flat_map(|(_, d)| sgd5::databases(d)).collect();
+    let databases: Vec<sgd5::Database> = files.iter().flat_map(|(_, d)| sgd5::databases(d)).collect();
     let named = Named::find(&pack, &databases);
     eprintln!(
         "{}: shader pack, {} graphics and {} compute pipelines; states named: {} depth-stencil, {} rasteriser, {} blend",
@@ -107,157 +135,231 @@ pub fn run(paths: &[PathBuf], threads: usize) -> Result<()> {
         let size = u32::from_le_bytes(bytes.get(0x18..0x1c)?.try_into().ok()?) as usize;
         Some((bytes.get(..size)?.to_vec(), stage))
     };
-    // A job's pipeline, or why it has none.
-    let prepare = |job: Job| -> Result<Prebuild, String> {
+    // A job's pipeline, or why it has none. The stream points into
+    // `first`/`pixel`, which the closure's caller keeps alive through `f`.
+    let with = |job: Job, f: &mut dyn FnMut(Result<&Prebuild, String>)| {
         let g = match job {
             Job::Graphics(i) => &graphics[i],
             Job::Compute(i) => {
-                let (cs, _) = container(compute[i].stage.program).ok_or("shader not found")?;
-                return Ok(Prebuild::compute(&cs));
+                return match container(compute[i].stage.program) {
+                    Some((cs, _)) => f(Ok(&Prebuild::compute(&cs))),
+                    None => f(Err("shader not found".into())),
+                };
             }
         };
         let [ps, vs, gs, ..] = g.stages;
         if g.stages[3..].iter().any(Option::is_some) {
-            return Err("stages other than vertex, mesh and pixel".into());
+            return f(Err("stages other than vertex, mesh and pixel".into()));
         }
-        let (first, stage) = vs
-            .or(gs)
-            .and_then(|s| container(s.program))
-            .ok_or("shader not found")?;
+        let Some((first, stage)) = vs.or(gs).and_then(|s| container(s.program)) else {
+            return f(Err("shader not found".into()));
+        };
         let pixel = match ps {
-            Some(ps) => Some(container(ps.program).ok_or("shader not found")?.0),
+            Some(ps) => match container(ps.program) {
+                Some((c, _)) => Some(c),
+                None => return f(Err("shader not found".into())),
+            },
             None => None,
         };
         let mesh = match stage {
             HwStage::Ms => true,
             HwStage::Vs => false,
-            _ => return Err("first stage not a vertex or mesh shader".into()),
+            _ => return f(Err("first stage not a vertex or mesh shader".into())),
         };
-        let stream = pipelines::stream(g, &named, &first, mesh, pixel.as_deref()).map_err(|u| {
-            match u {
+        match pipelines::stream(g, &named, &first, mesh, pixel.as_deref()) {
+            Err(u) => f(Err(match u {
                 Unnamed::DepthStencil => "depth-stencil state not named",
                 Unnamed::Rasterizer => "rasteriser state not named",
                 Unnamed::Blend => "blend state not named",
                 Unnamed::Metadata => "metadata not read",
             }
-            .to_owned()
-        })?;
-        // SAFETY: the stream points at `first`, `pixel` and its own input
-        // elements, all alive here.
-        Ok(unsafe { Prebuild::graphics(stream.bytes()) })
+            .to_owned())),
+            // SAFETY: the stream points at `first`, `pixel` and its own
+            // input elements, all alive for the call.
+            Ok(stream) => f(Ok(&unsafe { Prebuild::graphics(stream.bytes()) })),
+        }
     };
 
-    // A job's shaders as a run names them (diagnostics).
-    let shaders_of = |job: Job| {
-        let stages: Vec<(&str, &[u8])> = match job {
-            Job::Compute(i) => vec![("compute", compute[i].stage.program)],
-            Job::Graphics(i) => {
-                let [ps, vs, gs, ..] = graphics[i].stages;
-                let first = vs
-                    .map(|s| ("vertex", s.program))
-                    .or(gs.map(|s| ("mesh", s.program)));
-                first
-                    .into_iter()
-                    .chain(ps.map(|s| ("pixel", s.program)))
-                    .collect()
-            }
-        };
-        let names: Vec<String> = (stages.iter())
-            .map(|(stage, code)| match container(code) {
-                Some((c, _)) => format!("{stage} {}", &blake3::hash(&c).to_hex()[..16]),
-                None => format!("{stage} ?"),
-            })
-            .collect();
-        format!("[{}]", names.join(", "))
-    };
     let mut jobs: Vec<Job> = (0..compute.len()).map(Job::Compute).collect();
     jobs.extend((0..graphics.len()).map(Job::Graphics));
-    // Diagnostics, `VICTORY_PREBUILD_KEYS=<file>`: make nothing, list each
-    // record's key (what a run lists pipelines by) with its shaders and
-    // state as a run's `VICTORY_PIPELINE_LOG` has them, or why it is
-    // skipped; and the records each source named states for.
-    let keys_only = std::env::var_os("VICTORY_PREBUILD_KEYS");
-    if keys_only.is_some() {
-        let mut by: BTreeMap<(&str, &str), usize> = BTreeMap::new();
-        for g in &graphics {
-            for (kind, h) in [
-                ("depth-stencil", g.depth_stencil_hash),
-                ("rasteriser", g.rasterizer_hash),
-                ("blend", g.blend_hash),
-            ] {
-                *by.entry((kind, named.source.get(&h).copied().unwrap_or("not named")))
-                    .or_default() += 1;
-            }
-        }
-        for ((kind, source), n) in by {
-            println!("  {kind:<14} {source:<12} {n:>6} records");
-        }
-    }
     let skipped: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
     let skip = |why: String| *lock(&skipped).entry(why).or_default() += 1;
-    // First every record's key, which needs no translation: what a
-    // pre-build put in the library is skipped, what an earlier run drew
-    // with is made first.
-    let lines: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    let todo: Mutex<Vec<(bool, Job)>> = Mutex::new(Vec::new());
-    let listed = AtomicUsize::new(0);
-    each(&jobs, threads, |job| match prepare(job) {
-        Ok(p) if keys_only.is_some() => {
-            lock(&lines).push(format!("{}\t{job:?}\t{}", p.key(), p.describe()))
-        }
-        Ok(p) if pipeline::prebuilt(&p.key()) => drop(listed.fetch_add(1, Ordering::Relaxed)),
-        Ok(p) => lock(&todo).push((!pipeline::wanted_early(&p.key()), job)),
-        Err(why) => {
-            if keys_only.is_some() {
-                lock(&lines).push(format!("-\t{job:?}\t{}\t{why}", shaders_of(job)));
-            }
-            skip(why);
-        }
-    });
-    let listed = listed.into_inner();
-    if let Some(file) = keys_only {
-        std::fs::write(file, lock(&lines).join("\n"))?;
+    let done: HashSet<String> = read_list(&dir);
+    let mut crashed = read_keys(&dir.join(CRASHED_FILE));
+    let suspects = read_keys(&dir.join(INFLIGHT_FILE));
+    if suspects.len() == 1 {
+        // Made alone when the driver died: the culprit.
+        crashed.extend(suspects.iter().cloned());
+        let mut keys: Vec<&String> = crashed.iter().collect();
+        keys.sort();
+        let text: String = keys.iter().map(|k| format!("{k}\n")).collect();
+        let _ = std::fs::write(dir.join(CRASHED_FILE), text);
     }
+    if !crashed.is_empty() || !suspects.is_empty() {
+        println!("crashes      {} pipelines skipped (the driver died on them), {} suspects made first, alone", crashed.len(), suspects.len());
+    }
+    let first: Mutex<Vec<Job>> = Mutex::new(Vec::new());
+    let already = AtomicUsize::new(0);
+    // First every record's key (no translation): listed ones are skipped,
+    // what an earlier run drew with is made first.
+    let todo: Mutex<Vec<(bool, Job)>> = Mutex::new(Vec::new());
+    each(&jobs, threads, |job| {
+        with(job, &mut |p| match p {
+            Ok(p) if done.contains(&p.key()) => drop(already.fetch_add(1, Ordering::Relaxed)),
+            Ok(p) if crashed.contains(&p.key()) => skip("the host driver died on it in an earlier pre-build".into()),
+            Ok(p) if suspects.contains(&p.key()) => lock(&first).push(job),
+            Ok(p) if p.skipped().is_some() => skip(format!("VICTORY_SKIP_PIPELINES ({})", p.skipped().unwrap_or_default())),
+            Ok(p) => lock(&todo).push((!pipeline::wanted_early(&p.key()), job)),
+            Err(why) => skip(why),
+        })
+    });
     let mut todo = todo.into_inner().unwrap_or_else(|e| e.into_inner());
     todo.sort_by_key(|&(later, _)| later);
     let todo: Vec<Job> = todo.into_iter().map(|(_, job)| job).collect();
+    let first = first.into_inner().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "pipelines    {} in the pack, {} already pre-built, {} to make on {threads} threads",
+        jobs.len(),
+        already.load(Ordering::Relaxed),
+        todo.len() + first.len()
+    );
 
-    let next = AtomicUsize::new(0);
     let (made0, loaded0) = pipeline::pipeline_counts();
-    let counts = || {
-        let (made, loaded) = pipeline::pipeline_counts();
-        (made - made0, loaded - loaded0)
+    let pending: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut listed: Vec<String> = done.into_iter().collect();
+    let next = AtomicUsize::new(0);
+    let finished = AtomicUsize::new(0);
+    let out = Mutex::new(std::io::stdout());
+    // Held by each make; a save takes it alone (the library is opened
+    // again then).
+    let gate = RwLock::new(());
+    let inflight: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    let note_inflight = |key: &str, making: bool| {
+        let mut keys = lock(&inflight);
+        if making {
+            keys.insert(key.to_owned());
+        } else {
+            keys.remove(key);
+        }
+        let text: String = keys.iter().map(|k| format!("{k}\n")).collect();
+        // Written before the driver sees it; the system keeps it if we die.
+        let _ = std::fs::write(dir.join(INFLIGHT_FILE), text);
     };
+    let make_one = |job: Job| {
+        with(job, &mut |p| {
+            let p = match p {
+                Ok(p) => p,
+                Err(why) => return skip(why),
+            };
+            let key = p.key();
+            {
+                // Before the driver sees it: the culprit if it dies.
+                let mut o = lock(&out);
+                let _ = writeln!(o, "> {key} [{}]", p.shaders());
+                let _ = o.flush();
+            }
+            let _making = gate.read().unwrap_or_else(|e| e.into_inner());
+            note_inflight(&key, true);
+            let made = p.make();
+            note_inflight(&key, false);
+            match made {
+                Ok(()) => lock(&pending).push(key),
+                Err(why) => skip(why),
+            }
+        });
+        finished.fetch_add(1, Ordering::Relaxed);
+    };
+    // The suspects of a crash, alone: the one the driver dies on is named.
+    first.iter().for_each(|&job| make_one(job));
     std::thread::scope(|s| {
         let workers: Vec<_> = (0..threads.min(todo.len()))
             .map(|_| {
                 s.spawn(|| {
                     while let Some(&job) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        if let Err(why) = prepare(job).and_then(|p| p.make()) {
-                            skip(why);
-                        }
+                        make_one(job);
                     }
                 })
             })
             .collect();
-        let (n, what) = (todo.len(), "pipelines to make");
-        crate::translate::report(pack_path, n, what, &next, started, &workers, || {
-            let (made, loaded) = counts();
-            format!("; {made} made, {loaded} found in the library")
-        });
+        let mut last_save = Instant::now();
+        while !workers.iter().all(|w| w.is_finished()) {
+            std::thread::sleep(Duration::from_millis(250));
+            if last_save.elapsed() >= Duration::from_secs(60) || lock(&pending).len() >= SAVE_EVERY {
+                {
+                    let _alone = gate.write().unwrap_or_else(|e| e.into_inner());
+                    save(&dir, &pending, &mut listed);
+                }
+                last_save = Instant::now();
+                let (made, loaded) = pipeline::pipeline_counts();
+                eprintln!(
+                    "{}: {}/{} pipelines, {} made, {} found in the library, {:.0} s",
+                    pack_path.display(),
+                    finished.load(Ordering::Relaxed),
+                    todo.len(),
+                    made - made0,
+                    loaded - loaded0,
+                    started.elapsed().as_secs_f64()
+                );
+            }
+        }
     });
-    pipeline::save_pipeline_cache();
-    let (made, loaded) = counts();
+    save(&dir, &pending, &mut listed);
+    let _ = std::fs::remove_file(dir.join(INFLIGHT_FILE));
+    let (made, loaded) = pipeline::pipeline_counts();
     println!(
-        "pipelines    {} in the pack, {:.1} s: {made} made, {} already in the library",
+        "pipelines    {} in the pack, {:.1} s: {} made, {} found in the library, {} already pre-built",
         jobs.len(),
         started.elapsed().as_secs_f64(),
-        listed + loaded as usize,
+        made - made0,
+        loaded - loaded0,
+        already.load(Ordering::Relaxed),
     );
     for (why, n) in lock(&skipped).iter() {
         println!("  {n:>7}  skipped: {why}");
     }
     Ok(())
+}
+
+/// Saves the library (and opens it again), then lists the keys made before
+/// the save began.
+fn save(dir: &Path, pending: &Mutex<Vec<String>>, listed: &mut Vec<String>) {
+    let saved: Vec<String> = std::mem::take(&mut *lock(pending));
+    pipeline::save_and_reopen_pipeline_cache();
+    listed.extend(saved);
+    let Ok(meta) = std::fs::metadata(dir.join(LIBRARY_FILE)) else { return };
+    let text = format!("library {}\n{}\n", meta.len(), listed.join("\n"));
+    let tmp = dir.join(LIST_FILE).with_extension("tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, dir.join(LIST_FILE));
+    }
+}
+
+/// The keys an earlier pre-build listed, if the library still holds them:
+/// it is at least as big as when they were listed (a run saving the library
+/// after them only adds to it; one the driver refused starts empty).
+fn read_list(dir: &Path) -> HashSet<String> {
+    let (Ok(text), Ok(meta)) = (std::fs::read_to_string(dir.join(LIST_FILE)), std::fs::metadata(dir.join(LIBRARY_FILE)))
+    else {
+        return HashSet::new();
+    };
+    listed(&text, meta.len())
+}
+
+/// [`read_list`]'s reading of the list file `text` for a library of `len` bytes.
+fn listed(text: &str, len: u64) -> HashSet<String> {
+    let mut lines = text.lines();
+    let size = lines.next().and_then(|l| l.strip_prefix("library ")).and_then(|n| n.parse::<u64>().ok());
+    if size.is_none_or(|size| len < size) {
+        return HashSet::new();
+    }
+    lines.filter(|l| !l.is_empty()).map(str::to_owned).collect()
+}
+
+/// The keys a file lists, one a line (none without the file).
+fn read_keys(path: &Path) -> HashSet<String> {
+    std::fs::read_to_string(path)
+        .map(|t| t.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect())
+        .unwrap_or_default()
 }
 
 /// Runs `f` on every job, on `threads` threads.
@@ -279,7 +381,7 @@ fn program_ids(bytes: &[u8]) -> Vec<([u8; 24], HwStage)> {
     let Ok(c) = Container::parse(bytes) else {
         return Vec::new();
     };
-    let Some(part) = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) else {
+    let Some(part) = c.part(FourCC::DXIL) else {
         return Vec::new();
     };
     native_programs(part.data)
@@ -293,4 +395,16 @@ fn program_ids(bytes: &[u8]) -> Vec<([u8; 24], HwStage)> {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_list_holds_while_the_library_only_grows() {
+        let text = "library 100\na\nb\n";
+        assert_eq!(super::listed(text, 100).len(), 2);
+        assert_eq!(super::listed(text, 150).len(), 2);
+        assert!(super::listed(text, 99).is_empty());
+        assert!(super::listed("garbage\na\n", 100).is_empty());
+    }
 }
