@@ -146,9 +146,11 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    let rec_started = crate::record_timing::start();
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
-    f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
+    f(list, &mut crate::record_timing::lock_timed(state));
+    crate::record_timing::record_thread_call(rec_started);
     #[cfg(feature = "diagnostics")]
     crate::copystat::recorded(started);
 }
@@ -1088,7 +1090,7 @@ fn read_back(
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
-    let buffer = host.read_back_buffer(size).ok_or("no read-back buffer")?;
+    let (buffer, cap) = host.take_read_back(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
     list.twin_use(src.resource, false, false);
@@ -1116,7 +1118,7 @@ fn read_back(
         list.list
             .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
     };
-    list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize]);
+    list.defer_read_back(buffer, cap, data, [row as usize, rows as usize, pitch as usize]);
     Ok(())
 }
 
@@ -1430,6 +1432,8 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 };
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
+    #[cfg(windows)]
+    let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
     crate::pipeline::bound(pipeline);
     #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
@@ -1497,6 +1501,7 @@ mod state {
     }
 
     pub(super) extern "system" fn topology(this: This, topology: u32) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         with_state(this, |list, s| s.set_topology(list, topology));
     }
     pub(super) extern "system" fn viewports(
@@ -1504,35 +1509,44 @@ mod state {
         count: u32,
         viewports: *const D3D12_VIEWPORT,
     ) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         // (Through the draw state, which keeps them for the host list
         // that continues this one after a cut: `State::replay`.)
         with_state(this, |list, s| s.set_viewports(list, items(viewports, count)));
     }
     pub(super) extern "system" fn scissors(this: This, count: u32, rects: *const RECT) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         with_state(this, |list, s| s.set_scissors(list, items(rects, count)));
     }
     pub(super) extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         with_state(this, |list, s| {
             // SAFETY: the title passes four floats or null.
             s.set_blend_factor(list, unsafe { factor.as_ref() })
         });
     }
     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         with_state(this, |list, s| s.set_stencil_ref(list, reference));
     }
     pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         with_state(this, |list, s| s.set_depth_bounds(list, min, max));
     }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
     }
     pub(super) extern "system" fn compute_table(this: This, slot: u32, handle: u64) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         with_state(this, |_, s| s.set_table(true, slot, handle));
     }
     pub(super) extern "system" fn graphics_table(this: This, slot: u32, handle: u64) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         with_state(this, |_, s| s.set_table(false, slot, handle));
     }
     pub(super) extern "system" fn compute_constant(this: This, slot: u32, value: u32, offset: u32) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         with_state(this, |_, s| s.set_constants(true, slot, &[value], offset));
     }
     pub(super) extern "system" fn graphics_constant(
@@ -1541,6 +1555,7 @@ mod state {
         value: u32,
         offset: u32,
     ) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         with_state(this, |_, s| s.set_constants(false, slot, &[value], offset));
     }
     pub(super) extern "system" fn compute_constants(
@@ -1550,6 +1565,7 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         with_state(this, |_, s| {
             s.set_constants(true, slot, items(values, count), offset)
         });
@@ -1561,18 +1577,22 @@ mod state {
         values: *const u32,
         offset: u32,
     ) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         with_state(this, |_, s| {
             s.set_constants(false, slot, items(values, count), offset)
         });
     }
     /// Root constant buffer, shader resource and unordered access views.
     pub(super) extern "system" fn compute_view(this: This, slot: u32, address: u64) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         with_state(this, |_, s| s.set_view(true, slot, address));
     }
     pub(super) extern "system" fn graphics_view(this: This, slot: u32, address: u64) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         with_state(this, |_, s| s.set_view(false, slot, address));
     }
     pub(super) extern "system" fn index_buffer(this: This, view: *const IndexView) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         // SAFETY: the title passes a view or null.
         with_state(this, |_, s| s.set_index_buffer(unsafe { view.as_ref() }));
     }
@@ -1582,6 +1602,7 @@ mod state {
         count: u32,
         views: *const VertexView,
     ) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::StateSetCall);
         with_state(this, |_, s| {
             if views.is_null() {
                 s.clear_vertex_buffers(start, count);
@@ -1599,6 +1620,7 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::SetTargetsCall);
         let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
             // SAFETY: the title passes the first handle.
             let first = unsafe { *handles };
@@ -1617,18 +1639,21 @@ mod state {
         first: u32,
         first_instance: u32,
     ) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DrawCall);
         super::count_draw();
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
         });
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DispatchCall);
         super::count_dispatch();
         with_state(this, |list, s| s.dispatch(list, x, y, z));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DrawCall);
         super::count_draw();
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1646,6 +1671,7 @@ mod state {
         indirect: u64,
         _payload: u64,
     ) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DrawCall);
         super::count_draw();
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1662,6 +1688,7 @@ mod state {
         base: i32,
         first_instance: u32,
     ) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DrawCall);
         super::count_draw();
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
@@ -1727,6 +1754,8 @@ extern "system" fn execute_indirect(
     count: This,
     count_offset: u64,
 ) {
+    #[cfg(windows)]
+    let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DrawCall);
     count_draw();
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;

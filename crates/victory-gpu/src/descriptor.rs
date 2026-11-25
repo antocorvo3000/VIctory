@@ -56,7 +56,7 @@ pub(crate) struct Heap {
     /// descriptor order when a draw first uses them (decision 0007, step
     /// 3); slots written before wait in `pending`.
     #[cfg(windows)]
-    host: std::sync::OnceLock<Option<host::HostHeap>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<host::HostHeap>>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
     /// Changed pages of a placed shader-visible heap. Some titles copy
@@ -82,7 +82,7 @@ impl Heap {
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
         if let Some(h) = self.host.get() {
-            return h.as_ref();
+            return h.as_deref();
         }
         if self.desc.flags & SHADER_VISIBLE == 0 || !matches!(self.desc.kind, VIEWS_KIND | SAMPLERS)
         {
@@ -94,13 +94,16 @@ impl Heap {
         self.host
             .get_or_init(|| {
                 let step = u64::from(increment(self.desc.kind)?);
-                let h = host::HostHeap::new(self.samplers(), self.desc.count)?;
+                let h = std::sync::Arc::new(host::HostHeap::new(self.samplers(), self.desc.count)?);
+                if !self.samplers() {
+                    host::register_view_heap(&h);
+                }
                 for i in pending.drain(..) {
                     h.mirror(i, self.start + u64::from(i) * step, false);
                 }
                 Some(h)
             })
-            .as_ref()
+            .as_deref()
     }
 
     /// The handle of descriptor `index` of this heap.
@@ -126,15 +129,24 @@ const SHADER_VISIBLE: u32 = 1;
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
 
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let &(_, _, at) = heaps
-        .iter()
-        .find(|&&(start, end, _)| (start..end).contains(&handle))?;
+    let at = if crate::record_timing::record_parallel() {
+        let heaps = crate::record_timing::read_timed(&SHADER_HEAPS);
+        heaps
+            .iter()
+            .find(|&&(start, end, _)| (start..end).contains(&handle))
+            .map(|&(_, _, at)| at)?
+    } else {
+        let heaps = crate::record_timing::write_timed(&SHADER_HEAPS);
+        heaps
+            .iter()
+            .find(|&&(start, end, _)| (start..end).contains(&handle))
+            .map(|&(_, _, at)| at)?
+    };
     // SAFETY: registered heaps are live (removed when dropped).
     let heap = unsafe { &*(at as *const Heap) };
     Some((heap, heap.index(handle)?))
@@ -147,7 +159,15 @@ fn mirror(handle: u64) {
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
-    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+    if crate::record_timing::record_parallel()
+        && let Some(host) = heap.host.get()
+    {
+        if let Some(host) = host {
+            host.mirror(index, handle, false);
+        }
+        return;
+    }
+    let mut pending = crate::record_timing::lock_timed(&heap.pending);
     match heap.host.get() {
         None => pending.push(index),
         Some(host) => {
@@ -178,7 +198,26 @@ pub(crate) fn sync_heaps() {
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if crate::record_timing::record_parallel() {
+        let g = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        sync_heaps_with(&g, &mut page_bytes, &mut pages, &mut looked, &mut mirrored);
+    } else {
+        let g = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
+        sync_heaps_with(&g, &mut page_bytes, &mut pages, &mut looked, &mut mirrored);
+    }
+    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
+        count.fetch_add(n, Relaxed);
+    }
+}
+
+#[cfg(windows)]
+fn sync_heaps_with(
+    heaps: &[(u64, u64, usize)],
+    page_bytes: &mut Vec<u8>,
+    pages: &mut u64,
+    looked: &mut u64,
+    mirrored: &mut u64,
+) {
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -200,8 +239,8 @@ pub(crate) fn sync_heaps() {
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
                 page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
-                    pages += 1;
+                if crate::host::read_into(from as *const u8, page_bytes) {
+                    *pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     for index in slots {
                         let handle = start + index * step;
@@ -213,21 +252,17 @@ pub(crate) fn sync_heaps() {
                         let Some(record) = page_bytes.get(at..at + step as usize) else {
                             continue;
                         };
-                        looked += 1;
+                        *looked += 1;
                         // Only a record that is not the one last seen there
                         // (`HostHeap::mirror_copied`).
                         if host.mirror_copied(index as u32, handle, record) {
-                            mirrored += 1;
+                            *mirrored += 1;
                         }
                     }
                 }
                 page += crate::watch::PAGE;
             }
         }
-    }
-    drop(heaps);
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
-        count.fetch_add(n, Relaxed);
     }
 }
 
@@ -277,8 +312,14 @@ fn changed_slots(
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
+    let found = if crate::record_timing::record_parallel() {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        heaps.iter().any(|&(_, _, h)| h == heap)
+    } else {
+        let heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
+        heaps.iter().any(|&(_, _, h)| h == heap)
+    };
+    if found
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
@@ -290,7 +331,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
     }
 }
@@ -309,7 +350,7 @@ pub(crate) extern "system" fn increment_size(_: This, kind: u32) -> u32 {
 /// What our render target views hold: the resource and the view
 /// description, turned into a host view when a command uses them.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RtvRecord {
     tag: u32,
     described: u32,
@@ -363,20 +404,14 @@ impl RtvRecord {
     }
 }
 
-/// Device method: records the view at `handle` (descriptor memory).
-pub(crate) extern "system" fn create_rtv(
-    _: This,
-    resource: This,
-    desc: *const [u32; 6],
-    handle: u64,
-) {
+fn write_rtv_record(resource: This, desc: *const [u32; 6], handle: u64, tag: u32) {
     if handle == 0 {
         return;
     }
     // SAFETY: the title passes a description or null.
     let described = unsafe { desc.as_ref() };
     let record = RtvRecord {
-        tag: RTV_TAG,
+        tag,
         described: u32::from(described.is_some()),
         resource,
         desc: described.copied().unwrap_or_default(),
@@ -385,18 +420,28 @@ pub(crate) extern "system" fn create_rtv(
     unsafe { (handle as *mut RtvRecord).write_unaligned(record) };
 }
 
-/// Device method: a depth view, recorded as render target views are.
-pub(crate) extern "system" fn create_dsv(
-    this: This,
+/// Device method: records the view at `handle` (descriptor memory).
+pub(crate) extern "system" fn create_rtv(
+    _: This,
     resource: This,
     desc: *const [u32; 6],
     handle: u64,
 ) {
-    create_rtv(this, resource, desc, handle);
-    if handle != 0 {
-        // SAFETY: just written by `create_rtv`.
-        unsafe { (handle as *mut u32).write_unaligned(DSV_TAG) };
-    }
+    #[cfg(windows)]
+    let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DescriptorWriteCall);
+    write_rtv_record(resource, desc, handle, RTV_TAG);
+}
+
+/// Device method: a depth view, recorded as render target views are.
+pub(crate) extern "system" fn create_dsv(
+    _: This,
+    resource: This,
+    desc: *const [u32; 6],
+    handle: u64,
+) {
+    #[cfg(windows)]
+    let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DescriptorWriteCall);
+    write_rtv_record(resource, desc, handle, DSV_TAG);
 }
 const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 
@@ -483,7 +528,7 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
 });
-const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
 /// them as one 64-bit key per slot). The top two bits of `generation` say
@@ -670,7 +715,14 @@ fn words_for(view: View) -> [u32; 2] {
 }
 
 fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
-    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+    #[cfg(windows)]
+    {
+        crate::record_timing::read_timed(&VIEWS)
+    }
+    #[cfg(not(windows))]
+    {
+        VIEWS.read().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
@@ -895,6 +947,8 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
+    #[cfg(windows)]
+    let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DescriptorWriteCall);
     if let Some([lo, hi, size, _]) = words(desc) {
         let address = u64::from(lo) | u64::from(hi) << 32;
         record(handle, View::Constant(address, size));
@@ -908,6 +962,8 @@ pub(crate) extern "system" fn create_srv(
     desc: *const [u32; 10],
     handle: u64,
 ) {
+    #[cfg(windows)]
+    let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DescriptorWriteCall);
     record(handle, View::Shader(resource as usize, words(desc)));
 }
 
@@ -919,6 +975,8 @@ pub(crate) extern "system" fn create_uav(
     desc: *const [u32; 10],
     handle: u64,
 ) {
+    #[cfg(windows)]
+    let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DescriptorWriteCall);
     let view = View::Unordered(resource as usize, counter as usize, words(desc));
     record(handle, view);
 }
@@ -932,6 +990,8 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
+    #[cfg(windows)]
+    let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DescriptorWriteCall);
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
         record(handle, View::Placed(false, resource, desc));
     }
@@ -943,6 +1003,8 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
+    #[cfg(windows)]
+    let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DescriptorWriteCall);
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
         record(handle, View::Placed(true, resource, desc));
     }
@@ -950,6 +1012,8 @@ pub(crate) extern "system" fn create_placed_uav(
 
 /// Device method.
 pub(crate) extern "system" fn create_sampler(_: This, desc: *const [u32; 13], handle: u64) {
+    #[cfg(windows)]
+    let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DescriptorWriteCall);
     if let Some(desc) = words(desc) {
         record(handle, View::Sampler(desc));
     }
@@ -957,13 +1021,14 @@ pub(crate) extern "system" fn create_sampler(_: This, desc: *const [u32; 13], ha
 
 /// Device method 0x1e8.
 pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], handle: u64) {
+    #[cfg(windows)]
+    let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DescriptorWriteCall);
     if let Some(desc) = words(desc) {
         record(handle, View::ConsoleSampler(desc));
     }
 }
 
-/// Device method: `count` descriptors of `kind` from `src` to `dst`.
-pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
+fn copy_simple_inner(count: u32, dst: u64, src: u64, kind: u32) {
     let step = u64::from(increment(kind).unwrap_or(0));
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
@@ -974,6 +1039,13 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
             mirror(dst + i * step);
         }
     }
+}
+
+/// Device method: `count` descriptors of `kind` from `src` to `dst`.
+pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
+    #[cfg(windows)]
+    let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DescriptorWriteCall);
+    copy_simple_inner(count, dst, src, kind);
 }
 
 /// Device method: ranges of descriptors (start and count each) gathered
@@ -989,6 +1061,8 @@ pub(crate) extern "system" fn copy(
     src_sizes: *const u32,
     kind: u32,
 ) {
+    #[cfg(windows)]
+    let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DescriptorWriteCall);
     let Some(step) = increment(kind) else {
         return;
     };
@@ -1020,7 +1094,7 @@ pub(crate) extern "system" fn copy(
                 (to, room) = next;
             }
             let n = left.min(room);
-            copy_simple(std::ptr::null(), n, to, from, kind);
+            copy_simple_inner(n, to, from, kind);
             let bytes = u64::from(n) * u64::from(step);
             (to, from, room, left) = (to + bytes, from + bytes, room - n, left - n);
         }
@@ -1096,7 +1170,7 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]

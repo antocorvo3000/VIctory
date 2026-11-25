@@ -33,8 +33,56 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 }
 
 /// Render target views live only until their command is recorded, so a
-/// ring of host descriptors is enough.
+/// ring of host descriptors is enough. When `VICTORY_DRAW_STATE_CACHE=1`,
+/// additional persistent slots hold cached views by `(resource, desc)`.
 const RTV_RING: u32 = 1024;
+const RTV_CACHE_SLOTS: usize = 1024;
+
+type ViewCacheKey = (usize, bool, [u32; 6]);
+
+struct RtvDsvCache {
+    map: std::collections::HashMap<ViewCacheKey, u32>,
+    ring: Vec<Option<ViewCacheKey>>,
+    next: usize,
+}
+
+impl RtvDsvCache {
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            ring: vec![None; RTV_CACHE_SLOTS],
+            next: 0,
+        }
+    }
+
+    fn get(&self, key: &ViewCacheKey) -> Option<u32> {
+        self.map.get(key).copied()
+    }
+
+    fn insert(&mut self, key: ViewCacheKey) -> u32 {
+        if let Some(&slot) = self.map.get(&key) {
+            return slot;
+        }
+        let idx = self.next;
+        self.next = (self.next + 1) % self.ring.len();
+        if let Some(old) = self.ring[idx].take() {
+            self.map.remove(&old);
+        }
+        let slot = RTV_RING + idx as u32;
+        self.ring[idx] = Some(key);
+        self.map.insert(key, slot);
+        slot
+    }
+
+    fn invalidate(&mut self, resource_raw: usize) {
+        self.map.retain(|k, _| k.0 != resource_raw);
+        for slot in &mut self.ring {
+            if slot.is_some_and(|k| k.0 == resource_raw) {
+                *slot = None;
+            }
+        }
+    }
+}
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -44,10 +92,14 @@ pub(crate) struct Host {
     submitted: Mutex<u64>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
+    rtv_cpu_start: usize,
     rtv_size: u32,
+    rtv_cache: Mutex<RtvDsvCache>,
     /// A ring of depth views, used as `rtvs`.
     dsvs: ID3D12DescriptorHeap,
+    dsv_cpu_start: usize,
     dsv_size: u32,
+    dsv_cache: Mutex<RtvDsvCache>,
     next_dsv: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
@@ -199,6 +251,7 @@ fn sweep() {
         return;
     }
     crate::pipeline::trim_library();
+    trim_pools();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
@@ -535,10 +588,23 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
+
+/// Drops any cached host RTV/DSV entries for a host texture resource about to
+/// be released.
+pub(crate) fn invalidate_views(resource_raw: usize) {
+    if resource_raw == 0 || !crate::draw::draw_state_cache() {
+        return;
+    }
+    if let Some(Some(host)) = HOST.get() {
+        host.rtv_cache.lock().unwrap_or_else(|e| e.into_inner()).invalidate(resource_raw);
+        host.dsv_cache.lock().unwrap_or_else(|e| e.into_inner()).invalidate(resource_raw);
+    }
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
@@ -650,16 +716,18 @@ fn create() -> windows::core::Result<Host> {
         let rtvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: RTV_RING,
+                NumDescriptors: RTV_RING + RTV_CACHE_SLOTS as u32,
                 ..Default::default()
             })?;
+        let rtv_cpu_start = rtvs.GetCPUDescriptorHandleForHeapStart().ptr;
         let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         let dsvs: ID3D12DescriptorHeap =
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-                NumDescriptors: RTV_RING,
+                NumDescriptors: RTV_RING + RTV_CACHE_SLOTS as u32,
                 ..Default::default()
             })?;
+        let dsv_cpu_start = dsvs.GetCPUDescriptorHandleForHeapStart().ptr;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
@@ -672,9 +740,13 @@ fn create() -> windows::core::Result<Host> {
             submitted: Mutex::new(0),
             event,
             rtvs,
+            rtv_cpu_start,
             rtv_size,
+            rtv_cache: Mutex::new(RtvDsvCache::new()),
             dsvs,
+            dsv_cpu_start,
             dsv_size,
+            dsv_cache: Mutex::new(RtvDsvCache::new()),
             next_dsv: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
@@ -750,6 +822,40 @@ mod tests {
         assert_eq!(s.update(1, 'a', BUFFER_READ), Some(BUFFER_WRITE));
         let lasts: Vec<_> = s.lasts().map(|(r, l)| (*r, l)).collect();
         assert_eq!(lasts, [('a', BUFFER_READ)]);
+    }
+
+    #[test]
+    fn heap_buffer_reads_sync_after_writes_and_across_lists() {
+        let mut list = BufferStates::default();
+        let (mut writes, mut synced) = (0u64, u64::MAX);
+        assert!(super::heap_sync_needed(writes, synced));
+        let (barriers, kept) = list.sync_written_to_read();
+        assert!(barriers.is_empty());
+        assert!(!kept);
+        synced = writes;
+        assert!(!super::heap_sync_needed(writes, synced));
+
+        // Compute skinning writes `'a'` on the list (`BUFFER_WRITE`).
+        list.next_command();
+        assert_eq!(list.update(1, 'a', BUFFER_WRITE), None);
+        writes += 1;
+        assert!(super::heap_sync_needed(writes, synced));
+
+        // Same command calling `heap_buffers` leaves `'a'` in WRITE and keeps sync pending.
+        let (barriers, kept) = list.sync_written_to_read();
+        assert!(barriers.is_empty());
+        assert!(kept);
+        assert_eq!(list.state(1), Some(BUFFER_WRITE));
+        assert!(super::heap_sync_needed(writes, synced));
+
+        // Next command (mesh draw) emits `BUFFER_WRITE -> BUFFER_READ` for `'a'` and clears sync.
+        list.next_command();
+        let (barriers, kept) = list.sync_written_to_read();
+        assert_eq!(barriers, [('a', BUFFER_WRITE)]);
+        assert!(!kept);
+        assert_eq!(list.state(1), Some(BUFFER_READ));
+        synced = writes;
+        assert!(!super::heap_sync_needed(writes, synced));
     }
 
     #[test]
@@ -831,8 +937,15 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Per-title-resource cached state/flags/copy for `VICTORY_TABLE_CACHE=1`.
+    resource_states: Mutex<std::collections::HashMap<usize, (std::sync::Arc<crate::resource::HostTexture>, u32, u32)>>,
     /// The states of the host copies of title memory the list uses.
     buffers: Mutex<BufferStates<ID3D12Resource>>,
+    /// Incremented when any buffer on this list enters [`BUFFER_WRITE`].
+    buffer_writes: std::sync::atomic::AtomicU64,
+    /// [`buffer_writes`] as of the latest heap-buffer read sync on this list
+    /// (`u64::MAX` until synced).
+    heap_reads_at: std::sync::atomic::AtomicU64,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
@@ -847,6 +960,9 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Incremented whenever a deferred title-memory copy/run or reset happens
+    /// on this list, so per-list draw caches know when a refresh can be skipped.
+    copy_gen: std::sync::atomic::AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -968,6 +1084,38 @@ impl<R> BufferStates<R> {
     pub(crate) fn clear(&mut self) {
         self.by_copy.clear();
     }
+
+    #[cfg(test)]
+    pub(crate) fn state(&self, copy: usize) -> Option<u32> {
+        self.by_copy.get(&copy).map(|(_, last, _, _)| *last)
+    }
+
+    /// Transitions buffers currently in [`BUFFER_WRITE`] from earlier commands
+    /// back to [`BUFFER_READ`], returning `(resource, before)` transitions and
+    /// whether the current command kept any buffer in [`BUFFER_WRITE`].
+    pub(crate) fn sync_written_to_read(&mut self) -> (Vec<(R, u32)>, bool)
+    where
+        R: Clone,
+    {
+        let command = self.command;
+        let mut barriers = Vec::new();
+        let mut kept_write = false;
+        for (_, last, wrote, r) in self.by_copy.values_mut() {
+            if *last == BUFFER_WRITE {
+                if *wrote == Some(command) {
+                    kept_write = true;
+                } else {
+                    barriers.push((r.clone(), *last));
+                    *last = BUFFER_READ;
+                }
+            }
+        }
+        (barriers, kept_write)
+    }
+}
+
+pub(crate) fn heap_sync_needed(writes: u64, synced_at: u64) -> bool {
+    synced_at == u64::MAX || synced_at != writes
 }
 
 /// What a list does with a depth texture that has a colour twin
@@ -1562,6 +1710,158 @@ impl<T> Spare<T> {
 
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
+
+/// Whether upload buffers are pooled across lists and texture staging
+/// (`VICTORY_UPLOAD_POOL=0`: allocates and frees a committed upload buffer
+/// per use, as before).
+fn upload_pool_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_POOL").is_some_and(|v| v == "1"))
+}
+
+/// Maximum bytes kept idle in the shared upload buffer pool
+/// (`VICTORY_UPLOAD_POOL_MB`, default 128 MiB).
+fn upload_pool_max_bytes() -> u64 {
+    static MAX: OnceLock<u64> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("VICTORY_UPLOAD_POOL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(128 << 20, |mb| mb.min(2048) << 20)
+    })
+}
+
+/// Whether read-back buffers are pooled across lists (`VICTORY_READBACK_POOL=0`
+/// allocates and frees a committed read-back buffer per use).
+fn readback_pool_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READBACK_POOL").is_some_and(|v| v == "1"))
+}
+
+const READBACK_POOL_MAX_BYTES: u64 = 32 << 20;
+
+/// A size-bucketed pool of reusable host buffers that tracks total kept bytes
+/// and return timestamps for idle trimming.
+struct SizedPool<T> {
+    kept: Vec<(T, u64, u64)>,
+    bytes: u64,
+}
+
+impl<T> SizedPool<T> {
+    const fn new() -> Self {
+        SizedPool {
+            kept: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    /// Takes the smallest entry with capacity in `[min_size, max_cap]`.
+    fn take(&mut self, min_size: u64, max_cap: u64) -> Option<(T, u64)> {
+        let mut best: Option<(usize, u64)> = None;
+        for (i, (_, cap, _)) in self.kept.iter().enumerate() {
+            if *cap >= min_size
+                && *cap <= max_cap
+                && best.is_none_or(|(_, best_cap)| *cap < best_cap)
+            {
+                best = Some((i, *cap));
+            }
+        }
+        let (idx, cap) = best?;
+        self.bytes -= cap;
+        Some((self.kept.swap_remove(idx).0, cap))
+    }
+
+    /// Keeps `item` of `cap` bytes unless doing so would exceed `max_bytes`;
+    /// otherwise returns `Some(item)` to drop outside the lock.
+    fn give(&mut self, item: T, cap: u64, max_bytes: u64, now: u64) -> Option<T> {
+        if cap == 0 || self.bytes.saturating_add(cap) > max_bytes {
+            return Some(item);
+        }
+        self.bytes += cap;
+        self.kept.push((item, cap, now));
+        None
+    }
+
+    /// Removes entries that have sat idle for at least `max_age_ms`.
+    fn trim_idle(&mut self, max_age_ms: u64, now: u64) -> Vec<T> {
+        let mut dropped = Vec::new();
+        let mut i = 0;
+        while i < self.kept.len() {
+            if now.saturating_sub(self.kept[i].2) >= max_age_ms {
+                let (item, cap, _) = self.kept.swap_remove(i);
+                self.bytes -= cap;
+                dropped.push(item);
+            } else {
+                i += 1;
+            }
+        }
+        dropped
+    }
+}
+
+struct UploadBuf(ID3D12Resource, usize);
+// SAFETY: a D3D12 upload buffer resource and its persistent CPU mapping.
+unsafe impl Send for UploadBuf {}
+
+static UPLOAD_POOL: Mutex<SizedPool<UploadBuf>> = Mutex::new(SizedPool::new());
+static READBACK_POOL: Mutex<SizedPool<ID3D12Resource>> = Mutex::new(SizedPool::new());
+
+/// Upload pool hits, misses; read-back pool hits, misses.
+pub(crate) static POOL_STATS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn pool_max_cap(size: u64) -> u64 {
+    size.saturating_mul(2).max(size.saturating_add(64 << 10))
+}
+
+/// Returns a pooled upload buffer `(buffer, mapping, capacity)` to the pool.
+pub(crate) fn give_upload(buffer: ID3D12Resource, data: *mut u8, cap: u64) {
+    if !upload_pool_on() || cap == 0 {
+        drop(buffer);
+        return;
+    }
+    let max_bytes = upload_pool_max_bytes();
+    let dropped = {
+        let mut pool = UPLOAD_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.give(UploadBuf(buffer, data as usize), cap, max_bytes, now_ms())
+    };
+    drop(dropped);
+}
+
+/// Returns a pooled read-back buffer to the pool.
+pub(crate) fn give_read_back(buffer: ID3D12Resource, cap: u64) {
+    if !readback_pool_on() || cap == 0 {
+        drop(buffer);
+        return;
+    }
+    let dropped = {
+        let mut pool = READBACK_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.give(buffer, cap, READBACK_POOL_MAX_BYTES, now_ms())
+    };
+    drop(dropped);
+}
+
+/// Trims idle upload and read-back buffers from the shared pools.
+fn trim_pools() {
+    let age = ram_idle_ms(available_physical_ram());
+    let now = now_ms();
+    let dropped_up = UPLOAD_POOL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .trim_idle(age, now);
+    let dropped_rb = READBACK_POOL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .trim_idle(age, now);
+    drop(dropped_up);
+    drop(dropped_rb);
+}
+
+pub(crate) fn pool_bytes() -> [u64; 2] {
+    let up = UPLOAD_POOL.lock().unwrap_or_else(|e| e.into_inner()).bytes;
+    let rb = READBACK_POOL.lock().unwrap_or_else(|e| e.into_inner()).bytes;
+    [up, rb]
+}
 
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
@@ -2207,6 +2507,9 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// Checks whether an already-uploaded texture (whose staging buffer was
+    /// dropped) changed in title memory: once per submission.
+    TextureCheck(std::sync::Arc<crate::texture::History>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2216,7 +2519,8 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
-    uploads: Vec<ID3D12Resource>,
+    /// Upload buffers held until list reset: (buffer, mapped ptr, cap, return to pool).
+    uploads: Vec<(ID3D12Resource, usize, u64, bool)>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -2232,10 +2536,10 @@ struct Deferred {
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
     /// Textures read back (texture to buffer copies), done once the list
-    /// has run: the host buffer the list copies the texels into, the title
-    /// memory they go to, the bytes of a row, the rows, the title's row
-    /// pitch.
-    backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// has run: the host buffer the list copies the texels into, its
+    /// capacity, the title memory they go to, the bytes of a row, the rows,
+    /// the title's row pitch.
+    backs: Vec<(ID3D12Resource, u64, usize, [usize; 3])>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that
     /// the list's shaders write, copied when the list closes.
     back_wanted: Vec<usize>,
@@ -2248,11 +2552,11 @@ struct Deferred {
 impl Deferred {
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
-    fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
+    fn hold_upload(&mut self, buffer: ID3D12Resource, data: usize, cap: u64, size: u64, pooled: bool) {
         ALIVE[6].fetch_add(1, Ordering::Relaxed);
         ALIVE[7].fetch_add(size, Ordering::Relaxed);
         self.upload_bytes += size;
-        self.uploads.push(buffer);
+        self.uploads.push((buffer, data, cap, pooled));
     }
 }
 
@@ -2260,6 +2564,14 @@ impl Drop for Deferred {
     fn drop(&mut self) {
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        for (buffer, data, cap, pooled) in self.uploads.drain(..) {
+            if pooled {
+                give_upload(buffer, data as *mut u8, cap);
+            }
+        }
+        for (buffer, cap, _, _) in self.backs.drain(..) {
+            give_read_back(buffer, cap);
+        }
     }
 }
 
@@ -2806,7 +3118,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) | Step::TextureCheck(_) => {}
             }
         }
     }
@@ -3623,7 +3935,7 @@ fn read_backs(list: &HostList) {
     for back in &list.deferred().texture_backs {
         crate::texback::land(back);
     }
-    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+    for (buffer, _, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
@@ -3846,12 +4158,16 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                resource_states: Mutex::default(),
                 buffers: Mutex::default(),
+                buffer_writes: std::sync::atomic::AtomicU64::new(0),
+                heap_reads_at: std::sync::atomic::AtomicU64::new(u64::MAX),
                 twins: Mutex::default(),
                 prelude,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                copy_gen: std::sync::atomic::AtomicU64::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -5260,6 +5576,7 @@ impl Host {
         let mut settled = std::time::Duration::ZERO;
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
+        let ask_once_started = crate::record_timing::start();
         if crate::watch::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
             for list in runs {
@@ -5296,6 +5613,7 @@ impl Host {
                 settled += settling.elapsed();
             }
         }
+        crate::record_timing::add_since(crate::record_timing::Stage::SubmitAskOnce, ask_once_started);
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -5312,6 +5630,7 @@ impl Host {
         {
             #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
+            let _snap_timing = crate::record_timing::Scope::begin(crate::record_timing::Stage::SubmitSnapshots);
             crate::shadow::take_snapshots();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
@@ -5325,7 +5644,9 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
+        let card_started = crate::record_timing::start();
         let card = self.card_before(runs, flown);
+        crate::record_timing::add_since(crate::record_timing::Stage::SubmitCardBefore, card_started);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -5648,6 +5969,31 @@ impl Host {
         resource: Option<&ID3D12Resource>,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        if crate::draw::draw_state_cache() {
+            let raw = resource.map_or(0, |r| r.as_raw() as usize);
+            let words = desc.map_or([0; 6], |d| {
+                // SAFETY: D3D12_RENDER_TARGET_VIEW_DESC is 24 bytes ([u32; 6]).
+                unsafe { std::ptr::from_ref(d).cast::<[u32; 6]>().read_unaligned() }
+            });
+            let key = (raw, desc.is_some(), words);
+            let mut cache = self.rtv_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = cache.get(&key) {
+                return D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: self.rtv_cpu_start + (slot * self.rtv_size) as usize,
+                };
+            }
+            let slot = cache.insert(key);
+            drop(cache);
+            let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: self.rtv_cpu_start + (slot * self.rtv_size) as usize,
+            };
+            // SAFETY: a slot of our heap and a live resource or null typed view.
+            unsafe {
+                self.device
+                    .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
+            }
+            return handle;
+        }
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource, or none with a
         // description (a typed null view).
@@ -5666,6 +6012,31 @@ impl Host {
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        if crate::draw::draw_state_cache() {
+            let raw = resource.as_raw() as usize;
+            let words = desc.map_or([0; 6], |d| {
+                // SAFETY: D3D12_DEPTH_STENCIL_VIEW_DESC is 24 bytes ([u32; 6]).
+                unsafe { std::ptr::from_ref(d).cast::<[u32; 6]>().read_unaligned() }
+            });
+            let key = (raw, desc.is_some(), words);
+            let mut cache = self.dsv_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(slot) = cache.get(&key) {
+                return D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: self.dsv_cpu_start + (slot * self.dsv_size) as usize,
+                };
+            }
+            let slot = cache.insert(key);
+            drop(cache);
+            let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: self.dsv_cpu_start + (slot * self.dsv_size) as usize,
+            };
+            // SAFETY: a slot of our heap and a live resource.
+            unsafe {
+                self.device
+                    .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
+            }
+            return handle;
+        }
         let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
@@ -5795,9 +6166,13 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
+        self.copy_gen.fetch_add(1, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.resource_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.buffers.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.buffer_writes.store(0, Ordering::Relaxed);
+        self.heap_reads_at.store(u64::MAX, Ordering::Relaxed);
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -5833,6 +6208,52 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
+        if crate::draw::table_cache() && !resource.is_null() {
+            let mut rstates = self.resource_states.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((copy, flags, last)) = rstates.get_mut(&(resource as usize)) {
+                let wanted = legal_for(*flags, wanted);
+                if *last == wanted {
+                    return None;
+                }
+                let before = std::mem::replace(last, wanted);
+                let copy_key = std::sync::Arc::as_ptr(copy) as usize;
+                let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(entry) = states.get_mut(&copy_key) {
+                    entry.1 = wanted;
+                }
+                // SAFETY: `copy` is held alive inside `states` until list reset.
+                let tex = unsafe { &*std::ptr::from_ref(&copy.texture) };
+                return Some((tex, before));
+            }
+            drop(rstates);
+            let copy = crate::resource::host_copy(resource)?;
+            // SAFETY: live resource.
+            let flags = unsafe { copy.texture.GetDesc() }.Flags.0 as u32;
+            let wanted = legal_for(flags, wanted);
+            let copy_key = std::sync::Arc::as_ptr(&copy) as usize;
+            let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            let result = match states.entry(copy_key) {
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert((wanted, wanted, copy.clone()));
+                    None
+                }
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                    if before != wanted {
+                        // SAFETY: `copy` is held alive inside `states` until list reset.
+                        Some((unsafe { &*std::ptr::from_ref(&copy.texture) }, before))
+                    } else {
+                        None
+                    }
+                }
+            };
+            drop(states);
+            self.resource_states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(resource as usize, (copy, flags, wanted));
+            return result;
+        }
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
         let wanted = legal_state(texture, wanted);
@@ -6081,6 +6502,9 @@ impl HostList {
     /// Moves a host copy of title memory to `wanted` ([`BUFFER_READ`] or
     /// [`BUFFER_WRITE`]) in this list: see [`BufferStates`].
     pub(crate) fn buffer_state(&self, buffer: &ID3D12Resource, wanted: u32) {
+        if wanted == BUFFER_WRITE {
+            self.buffer_writes.fetch_add(1, Ordering::Relaxed);
+        }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(before) = buffers.update(buffer.as_raw() as usize, buffer.clone(), wanted) {
             let barrier = transition(
@@ -6093,12 +6517,49 @@ impl HostList {
         }
     }
 
+    /// Whether heap buffer read states must be (re-)applied on this list.
+    pub(crate) fn needs_heap_reads(&self) -> bool {
+        heap_sync_needed(
+            self.buffer_writes.load(Ordering::Relaxed),
+            self.heap_reads_at.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Transitions any host buffers previously placed in [`BUFFER_WRITE`] on
+    /// this list into [`BUFFER_READ`] for subsequent indexed heap reads.
+    pub(crate) fn sync_heap_reads(&self) {
+        let writes = self.buffer_writes.load(Ordering::Relaxed);
+        let (barriers, kept_write) = self
+            .buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sync_written_to_read();
+        if !barriers.is_empty() {
+            let raw: Vec<D3D12_RESOURCE_BARRIER> = barriers
+                .iter()
+                .map(|(b, before)| {
+                    transition(
+                        b,
+                        D3D12_RESOURCE_STATES(*before as i32),
+                        D3D12_RESOURCE_STATES(BUFFER_READ as i32),
+                    )
+                })
+                .collect();
+            // SAFETY: an open list and buffers the list holds.
+            unsafe { self.list.ResourceBarrier(&raw) };
+        }
+        if !kept_write {
+            self.heap_reads_at.store(writes, Ordering::Relaxed);
+        }
+    }
+
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
     fn prelude(&self) -> Option<ID3D12CommandList> {
+        let _prelude_timing = crate::record_timing::Scope::begin(crate::record_timing::Stage::SubmitPrelude);
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -6279,9 +6740,16 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Generation counter incremented whenever title-memory writes (`defer_copy`,
+    /// `defer`, `reset`) clear `deferred.refreshed`.
+    pub(crate) fn copy_gen(&self) -> u64 {
+        self.copy_gen.load(Ordering::Relaxed)
+    }
+
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
+        self.copy_gen.fetch_add(1, Ordering::Relaxed);
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
@@ -6344,8 +6812,8 @@ impl HostList {
     /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
     /// the list is reset.
-    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
-        self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+    pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, cap: u64, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
+        self.deferred().backs.push((buffer, cap, dst as usize, [row, rows, pitch]));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -6354,13 +6822,11 @@ impl HostList {
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// reset (taken from the shared upload pool and returned on reset).
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
+        let (buffer, data, cap) = host.take_upload(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
+        self.deferred().hold_upload(buffer.clone(), data as usize, cap, size, true);
         Some((buffer, data))
     }
 
@@ -6371,11 +6837,11 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
+            let (buffer, data, cap) = host.take_upload(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().hold_upload(buffer, len);
+            self.deferred().hold_upload(buffer, data as usize, cap, len, true);
             return Some((gpu, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
@@ -6486,6 +6952,7 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
+        self.copy_gen.fetch_add(1, Ordering::Relaxed);
         self.deferred().copies.push(Step::Run(Box::new(work)));
         self.deferred().refreshed.clear();
     }
@@ -6499,6 +6966,12 @@ impl HostList {
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
+    }
+
+    /// Checks a texture's content hash / write-watch at submission when its
+    /// staging buffer was dropped after upload.
+    pub(crate) fn defer_texture_check(&self, history: std::sync::Arc<crate::texture::History>) {
+        self.deferred().copies.push(Step::TextureCheck(history));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -6566,6 +7039,7 @@ impl HostList {
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
+                    let _snap_timing = crate::record_timing::Scope::begin(crate::record_timing::Stage::SubmitSnapshots);
                     shadow.writing(*address, *len);
                     #[cfg(feature = "diagnostics")]
                     {
@@ -6575,13 +7049,23 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
+                    let _tex_timing = crate::record_timing::Scope::begin(crate::record_timing::Stage::SubmitTexture);
                     if batch.texture_due(staging) {
                         staging.refresh();
                     }
                     continue;
                 }
+                Step::TextureCheck(history) => {
+                    let _tex_timing = crate::record_timing::Scope::begin(crate::record_timing::Stage::SubmitTexture);
+                    if batch.texture_due(history) {
+                        history.check();
+                    }
+                    continue;
+                }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let copy_us = started.elapsed().as_micros() as u64;
+            crate::record_timing::add_since(crate::record_timing::Stage::SubmitCopyFill, Some(started));
+            PREPARING[0].fetch_add(copy_us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
     }
@@ -6659,6 +7143,7 @@ impl Batch {
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
+        crate::record_timing::add_since(crate::record_timing::Stage::SubmitRefresh, Some(started));
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
@@ -6933,7 +7418,56 @@ impl Host {
         &self.queue
     }
 
-    /// A buffer in the upload heap, mapped for writing.
+    /// A read-back buffer of at least `size` bytes, reusing one from the
+    /// shared pool when available. Returns `(buffer, capacity)`.
+    pub(crate) fn take_read_back(&self, size: u64) -> Option<(ID3D12Resource, u64)> {
+        let min_size = size.max(1);
+        if readback_pool_on() {
+            let max_cap = pool_max_cap(min_size);
+            if let Some((buf, cap)) = READBACK_POOL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(min_size, max_cap)
+            {
+                POOL_STATS[2].fetch_add(1, Ordering::Relaxed);
+                return Some((buf, cap));
+            }
+            POOL_STATS[3].fetch_add(1, Ordering::Relaxed);
+        }
+        let alloc = if readback_pool_on() {
+            min_size.next_multiple_of(64 << 10)
+        } else {
+            min_size
+        };
+        let buffer = self.read_back_buffer(alloc)?;
+        Some((buffer, alloc))
+    }
+
+    /// A buffer in the upload heap, mapped for writing, reusing one from the
+    /// shared pool when available. Returns `(buffer, mapping, capacity)`.
+    pub(crate) fn take_upload(&self, size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+        let min_size = size.max(1);
+        if upload_pool_on() {
+            let max_cap = pool_max_cap(min_size);
+            if let Some((UploadBuf(buf, ptr), cap)) = UPLOAD_POOL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(min_size, max_cap)
+            {
+                POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+                return Some((buf, ptr as *mut u8, cap));
+            }
+            POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+        }
+        let alloc = if upload_pool_on() {
+            min_size.next_multiple_of(64 << 10)
+        } else {
+            min_size
+        };
+        let (buffer, data) = self.upload_buffer(alloc)?;
+        Some((buffer, data, alloc))
+    }
+
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
@@ -7429,6 +7963,7 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         crate::shadow::copy_line(frames);
+        crate::record_timing::log(frames);
         {
             let [merges, groups] = [0, 1].map(|i| RELAY_WIDE[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if merges > 0.0 {
@@ -7507,6 +8042,30 @@ impl Meter {
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
             );
+            {
+                let [up_hit, up_miss, rb_hit, rb_miss] = [0, 1, 2, 3].map(|i| POOL_STATS[i].load(Ordering::Relaxed));
+                let [up_bytes, rb_bytes] = pool_bytes();
+                let read_bytes = crate::texture::read_pool_bytes();
+                tracing::info!(
+                    "scratch pools: upload {} hits / {} misses ({} MB kept), readback {} hits / {} misses ({} MB kept), read scratch {} MB kept",
+                    up_hit,
+                    up_miss,
+                    up_bytes >> 20,
+                    rb_hit,
+                    rb_miss,
+                    rb_bytes >> 20,
+                    read_bytes >> 20,
+                );
+                let [dropped_stg, checks_ok, skipped_reup] = crate::texture::history_stats();
+                tracing::info!(
+                    "texture staging & hash reuse: {dropped_stg} staging buffers dropped after upload, {checks_ok} submission checks unchanged, {skipped_reup} heap re-uploads skipped by hash"
+                );
+                let [soft_evict, restored, hard_drop, unpinned, evicted_bytes] = crate::resource::lru_stats();
+                tracing::info!(
+                    "texture LRU eviction: {soft_evict} soft-evicted ({} MB currently nonresident), {restored} restored without re-upload, {hard_drop} hard-dropped, {unpinned} pinned slots cleared",
+                    evicted_bytes >> 20
+                );
+            }
             crate::tiles::status();
             {
                 let [queued, due, away, partly, oldest] =
@@ -7597,6 +8156,13 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            let skipped = crate::texture::skipped_counts();
+            if skipped.iter().any(|&n| n > 0) {
+                tracing::info!(
+                    "title textures skipped at upload: no_layout={} unaddressable_swizzle={} msaa={} xor_disabled={} no_upload_buffer={} detile_failed={}",
+                    skipped[0], skipped[1], skipped[2], skipped[3], skipped[4], skipped[5]
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
@@ -8471,5 +9037,49 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn sized_pool_reuses_smallest_fit_respects_cap_and_trims_idle() {
+        use super::{SizedPool, pool_max_cap};
+        let mut pool: SizedPool<&'static str> = SizedPool::new();
+        assert_eq!(pool.give("a", 64 << 10, 512 << 10, 100), None);
+        assert_eq!(pool.give("b", 256 << 10, 512 << 10, 200), None);
+        assert_eq!(pool.give("c", 192 << 10, 512 << 10, 300), None);
+        // Exceeding max_bytes rejects the entry.
+        assert_eq!(pool.give("too_big", 128 << 10, 512 << 10, 350), Some("too_big"));
+        assert_eq!(pool.bytes, (64 + 256 + 192) << 10);
+
+        // Requesting 128 KiB picks 192 KiB (smallest fit <= max_cap), not 256 KiB.
+        assert_eq!(pool.take(128 << 10, pool_max_cap(128 << 10)), Some(("c", 192 << 10)));
+        // Requesting 16 KiB does not take 256 KiB because 256 KiB > pool_max_cap(16 KiB) = 80 KiB.
+        assert_eq!(pool.take(16 << 10, pool_max_cap(16 << 10)), Some(("a", 64 << 10)));
+        assert_eq!(pool.take(16 << 10, pool_max_cap(16 << 10)), None);
+
+        // Idle trimming removes only entries older than max_age_ms.
+        assert_eq!(pool.give("fresh", 64 << 10, 512 << 10, 1_500), None);
+        let dropped = pool.trim_idle(1_000, 1_600);
+        assert_eq!(dropped, vec!["b"]);
+        assert_eq!(pool.bytes, 64 << 10);
+    }
+
+    #[test]
+    fn rtv_dsv_cache_hits_evicts_and_invalidates_by_resource() {
+        use super::{RTV_CACHE_SLOTS, RtvDsvCache};
+        let mut cache = RtvDsvCache::new();
+        let k1 = (0x1000, true, [1, 2, 3, 4, 5, 6]);
+        let k2 = (0x2000, false, [0; 6]);
+        let s1 = cache.insert(k1);
+        let s2 = cache.insert(k2);
+        assert_eq!(cache.get(&k1), Some(s1));
+        assert_eq!(cache.get(&k2), Some(s2));
+        assert_ne!(s1, s2);
+        cache.invalidate(0x1000);
+        assert_eq!(cache.get(&k1), None);
+        assert_eq!(cache.get(&k2), Some(s2));
+        for i in 0..RTV_CACHE_SLOTS {
+            cache.insert((0x3000 + i * 16, false, [0; 6]));
+        }
+        assert_eq!(cache.get(&k2), None);
     }
 }

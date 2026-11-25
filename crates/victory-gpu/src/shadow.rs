@@ -2214,7 +2214,7 @@ pub(crate) struct StaleScan {
 /// submission refreshing one behind flights settled them all.
 pub(crate) fn stale_ask() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_STALE_ASK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STALE_ASK").is_none_or(|v| v != "0"))
 }
 
 /// The parts of `[a, e)` on `pages` (page numbers, in order).
@@ -2295,7 +2295,7 @@ static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(feature = "diagnostics")]
 pub(crate) fn windows() -> [u64; 3] {
     let asked: u64 = {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         loose
             .values()
             .map(|s| {
@@ -2319,7 +2319,7 @@ pub(crate) fn windows() -> [u64; 3] {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
@@ -2360,7 +2360,7 @@ pub(crate) fn let_go_idle() {
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         if map.is_empty() {
             return;
         }
@@ -2397,7 +2397,7 @@ pub(crate) fn let_go_idle() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         // Each copy once: a window may stand under several keys.
         let mut seen = std::collections::HashSet::new();
         let bytes: u64 = loose
@@ -3631,10 +3631,15 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+static BUFFERS: std::sync::RwLock<BTreeMap<(u64, usize), Entry>> =
+    std::sync::RwLock::new(BTreeMap::new());
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    crate::record_timing::write_timed(&BUFFERS)
+}
+
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    crate::record_timing::read_timed(&BUFFERS)
 }
 
 /// A title buffer exists at `start` (`len` bytes).
@@ -3657,7 +3662,7 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
+    buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -3673,7 +3678,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
@@ -3701,8 +3706,11 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, false) and the windows outside buffers that have a copy (start,
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
-    let mut spans: Vec<(u64, u64, bool)> = buffers().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut spans: Vec<(u64, u64, bool)> = buffers_read()
+        .iter()
+        .map(|(key, entry)| (key.0, entry.end - key.0, false))
+        .collect();
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
@@ -3741,6 +3749,23 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    if crate::record_timing::record_parallel() {
+        let map = buffers_read();
+        let found = map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end)
+            .map(|(k, e)| (*k, e.shadow.clone()));
+        drop(map);
+        let Some((key, shadow)) = found else {
+            return loose(address, end, len <= 1, any);
+        };
+        if let Some(shadow) = shadow {
+            return Some(shadow);
+        }
+        return lookup_create(key);
+    }
     let mut map = buffers();
     let key = map
         .range(..=(address, usize::MAX))
@@ -3752,6 +3777,15 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         drop(map);
         return loose(address, end, len <= 1, any);
     };
+    lookup_entry(&mut map, key)
+}
+
+fn lookup_create(key: (u64, usize)) -> Option<Arc<Shadow>> {
+    let mut map = buffers();
+    lookup_entry(&mut map, key)
+}
+
+fn lookup_entry(map: &mut BTreeMap<(u64, usize), Entry>, key: (u64, usize)) -> Option<Arc<Shadow>> {
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
@@ -3918,7 +3952,7 @@ fn fine() -> bool {
 /// which is copied once for each.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
-    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     cover(loose.keys().copied())
 }
 
@@ -3949,13 +3983,19 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 }
 
 /// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> =
+    std::sync::RwLock::new(BTreeMap::new());
 
-fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+fn loose_key(
+    map: &BTreeMap<(u64, u64), Arc<Shadow>>,
+    address: u64,
+    end: u64,
+    unsized_ask: bool,
+    any: bool,
+) -> (u64, u64) {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
-    let (start, len) = if unsized_ask && tails() {
+    if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
     } else if any && fine() && !unsized_ask {
@@ -3966,25 +4006,39 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         holder(there, address, end).unwrap_or(named)
     } else {
         named
-    };
-    // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn note_loose(shadow: &Shadow, address: u64, end: u64, unsized_ask: bool) {
+    // Under the lock (read or write), with the handing out: see `let_go_idle`.
+    shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+    shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+    shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+    if unsized_ask {
+        shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+    if crate::record_timing::record_parallel() {
+        let map = crate::record_timing::read_timed(&LOOSE);
+        let (start, len) = loose_key(&map, address, end, unsized_ask, any);
+        if let Some(shadow) = map.get(&(start, len)) {
+            note_loose(shadow, address, end, unsized_ask);
+            return Some(shadow.clone());
         }
-    };
+    }
+    let mut map = crate::record_timing::write_timed(&LOOSE);
+    let (start, len) = loose_key(&map, address, end, unsized_ask, any);
     if let Some(shadow) = map.get(&(start, len)) {
-        note(shadow);
+        note_loose(shadow, address, end, unsized_ask);
         return Some(shadow.clone());
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
-        note(&shadow);
+        note_loose(&shadow, address, end, unsized_ask);
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
@@ -4020,7 +4074,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
-    note(&shadow);
+    note_loose(&shadow, address, end, unsized_ask);
     map.insert((start, len), shadow.clone());
     Some(shadow)
 }
@@ -4379,13 +4433,13 @@ mod card_merge_tests {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
     all.extend(
         LOOSE
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
@@ -4406,4 +4460,37 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+
+    #[test]
+    fn rwlock_buffers_allow_concurrent_reads_and_preserve_miss_lookup() {
+        let base = 0x7a00_0000_0000u64;
+        register(0x1234, base, 4096);
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    for _ in 0..64 {
+                        let map = buffers_read();
+                        let found = map
+                            .range(..=(base + 128, usize::MAX))
+                            .rev()
+                            .take(64)
+                            .find(|(_, e)| e.end >= base + 256)
+                            .map(|(k, _)| *k);
+                        assert_eq!(found, Some((base, 0x1234)));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        unregister(0x1234, base);
+        let map = buffers_read();
+        assert!(!map.contains_key(&(base, 0x1234)));
+    }
 }

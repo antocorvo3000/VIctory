@@ -639,7 +639,19 @@ pub(crate) const SRGB: [(u32, u32); 7] = [
 /// format it picks is refused at the start screens and the device is removed).
 fn texture_cast() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CAST").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CAST").is_none_or(|v| v != "0"))
+}
+
+/// Whether block-compressed textures whose mip-0 dimensions are not
+/// multiples of 4 are padded up to 4 on host allocation fallback
+/// (`VICTORY_TEXTURE_BC_ALIGN=0`: refused by D3D12 as before).
+fn bc_align() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BC_ALIGN").is_none_or(|v| v != "0"))
+}
+
+fn is_bc(format: u32) -> bool {
+    matches!(format, 70..=84 | 94..=99)
 }
 
 /// Host resource format for `format` (after `pc_format` and
@@ -1166,6 +1178,7 @@ struct Resource {
 /// lists that name it).
 #[cfg(windows)]
 pub(crate) struct HostTexture {
+    pub(crate) id: u64,
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// The bytes the host gives it.
@@ -1177,6 +1190,12 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// Evicted from card residency via `ID3D12Device::Evict` while keeping its
+    /// host resource and content hash so `MakeResident` can restore it without
+    /// re-uploading if title memory has not changed.
+    evicted: std::sync::atomic::AtomicBool,
+    /// Frame when [`Self::evicted`] turned true.
+    evicted_frame: std::sync::atomic::AtomicU64,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1190,6 +1209,34 @@ type Made = (std::sync::Arc<HostTexture>, Option<std::sync::Arc<Twin>>);
 /// frame, of which a frame's lists name some hundreds (run 23), on a card
 /// with 12 GB. A title texture is memory the title has either way; its host
 /// copy is the card's.
+/// Bytes currently soft-evicted via `ID3D12Device::Evict` (still tracked in
+/// [`HOST_TEXTURES`][0]/[`KINDS`][0] as live COM handles, subtracted from `[1]`).
+#[cfg(windows)]
+static EVICTED_VRAM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Soft-evicted textures, restored via `MakeResident` without re-upload,
+/// hard-dropped textures, descriptor slots unpinned by LRU sweep.
+#[cfg(windows)]
+static LRU_STATS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Raw COM pointers of host textures whose owning title `Resource` was dropped
+/// while descriptor slots may still have kept references to them.
+#[cfg(windows)]
+static DEAD_TEXTURES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(windows)]
+pub(crate) fn lru_stats() -> [u64; 5] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [
+        LRU_STATS[0].load(Relaxed),
+        LRU_STATS[1].load(Relaxed),
+        LRU_STATS[2].load(Relaxed),
+        LRU_STATS[3].load(Relaxed),
+        EVICTED_VRAM.load(Relaxed),
+    ]
+}
+
 #[cfg(windows)]
 struct Hosted {
     /// The host copy (and twin) once made. Taken out again only by
@@ -1201,6 +1248,10 @@ struct Hosted {
     /// When the host copy was last asked for (`crate::host::moment`),
     /// written under `made`'s lock.
     used: std::sync::atomic::AtomicU64,
+    /// Frame number when this texture was last bound/used for rendering
+    /// (`crate::frame::current()`), used by LRU eviction so textures bound
+    /// every frame are never evicted.
+    last_bound_frame: std::sync::atomic::AtomicU64,
     /// The host refused to make it: not tried again.
     refused: std::sync::atomic::AtomicBool,
     /// Its host copy was let go as idle once.
@@ -1346,6 +1397,36 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         return None;
     }
     let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    if make
+        && let Some((host, _)) = made.as_ref()
+        && host.evicted.load(Relaxed)
+    {
+        let restored = crate::host::host().is_some_and(|h| {
+            let Ok(pageable) = windows::core::Interface::cast::<
+                windows::Win32::Graphics::Direct3D12::ID3D12Pageable,
+            >(&host.texture) else {
+                return false;
+            };
+            // SAFETY: `host.texture` is a live resource created on `h.device`.
+            unsafe { h.device.MakeResident(&[Some(pageable)]).is_ok() }
+        });
+        if restored {
+            host.evicted.store(false, Relaxed);
+            host.evicted_frame.store(0, Relaxed);
+            EVICTED_VRAM.fetch_sub(host.bytes, Relaxed);
+            HOST_TEXTURES[1].fetch_add(host.bytes, Relaxed);
+            if host.filled {
+                KINDS[1].fetch_add(host.bytes, Relaxed);
+            }
+            LRU_STATS[1].fetch_add(1, Relaxed);
+        } else if let Some((old_host, twin)) = made.take() {
+            crate::texture::unstage(this);
+            crate::host::retire(old_host);
+            if let Some(twin) = twin {
+                crate::host::retire(twin);
+            }
+        }
+    }
     if made.is_none() {
         if !make || r.host.refused.load(Relaxed) {
             return None;
@@ -1434,6 +1515,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         crate::descriptor::texture_made(this as usize);
     }
     r.host.used.store(crate::host::moment(), Relaxed);
+    if make {
+        r.host
+            .last_bound_frame
+            .store(crate::frame::current(), Relaxed);
+    }
     made.clone()
 }
 
@@ -1798,6 +1884,123 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// Called before a submission starts, by the thread that submits.
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
 #[cfg(windows)]
+fn lru_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LRU").is_some_and(|v| v == "1"))
+}
+
+#[cfg(windows)]
+fn lru_idle_frames() -> u64 {
+    static FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_LRU_FRAMES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60)
+            .max(2)
+    })
+}
+
+#[cfg(windows)]
+fn lru_target_pct() -> u64 {
+    static PCT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PCT.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_LRU_TARGET_PCT")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(80)
+            .clamp(50, 95)
+    })
+}
+
+#[cfg(windows)]
+fn evict_residency_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_TEXTURE_EVICT_RESIDENCY").is_none_or(|v| v != "0")
+    })
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LruCandidate {
+    at: usize,
+    host_id: u64,
+    raw: usize,
+    last_bound_frame: u64,
+    bytes: u64,
+    pinned: bool,
+    evicted: bool,
+    evicted_frame: u64,
+    can_evict: bool,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LruDecision {
+    SoftEvict,
+    HardDrop,
+}
+
+/// Pure LRU texture eviction policy:
+/// - Never evicts a texture bound within the last `min_idle_frames - 1` frames
+///   (with `min_idle_frames >= 2`, textures bound every frame stay resident).
+/// - Orders eligible idle textures by `last_bound_frame` ascending (least
+///   recently used first), unpinned before pinned when tied.
+/// - Soft-evicts eligible resident textures (preserving D3D12 handle & content
+///   hash via `Evict`/`MakeResident`) when under target VRAM; hard-drops
+///   oldest-first to shed `over_target_bytes`, when `evict_residency` is off,
+///   when `can_evict` is false, or after staying soft-evicted for
+///   `hard_idle_frames`.
+#[cfg(windows)]
+fn plan_lru_evictions(
+    candidates: &[LruCandidate],
+    frame: u64,
+    min_idle_frames: u64,
+    hard_idle_frames: u64,
+    over_target_bytes: u64,
+    evict_residency: bool,
+) -> Vec<(LruCandidate, LruDecision)> {
+    let min_idle = min_idle_frames.max(2);
+    let mut eligible: Vec<LruCandidate> = candidates
+        .iter()
+        .copied()
+        .filter(|c| frame.saturating_sub(c.last_bound_frame) >= min_idle)
+        .collect();
+    eligible.sort_by_key(|c| (c.last_bound_frame, c.pinned, c.at));
+
+    let mut plan = Vec::new();
+    let mut freed_resident = 0u64;
+    for c in eligible {
+        if c.evicted {
+            if frame.saturating_sub(c.evicted_frame) >= hard_idle_frames {
+                plan.push((c, LruDecision::HardDrop));
+            }
+            continue;
+        }
+        let hard = !evict_residency
+            || !c.can_evict
+            || freed_resident < over_target_bytes;
+        let decision = if hard {
+            LruDecision::HardDrop
+        } else {
+            LruDecision::SoftEvict
+        };
+        freed_resident = freed_resident.saturating_add(c.bytes);
+        plan.push((c, decision));
+    }
+    plan
+}
+
+/// Lets go of idle host copies of filled textures:
+/// - Default (`VICTORY_TEXTURE_LRU=1`): frame-based LRU across all filled
+///   textures unused for `VICTORY_TEXTURE_LRU_FRAMES` (default `60`),
+///   unpinning stale descriptor slots (`HostHeap::kept`) before calling
+///   `ID3D12Device::Evict` (`VICTORY_TEXTURE_EVICT_RESIDENCY=1`) or dropping.
+/// - Fallback (`VICTORY_TEXTURE_LRU=0`): legacy sweep requiring unpinned
+///   COM count == 1 and wall-clock idle time.
+/// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
+#[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
     const IDLE_FRAMES: u64 = 4;
@@ -1805,50 +2008,208 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
-    // For the trail (`crate::host::trail`): how many went, their bytes,
-    // and the first one.
-    let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    let dead = std::mem::take(&mut *DEAD_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()));
+    if !lru_on() {
+        if !dead.is_empty() {
+            let dead_set: std::collections::HashSet<usize> = dead.into_iter().collect();
+            let unmade = crate::descriptor::host::unmake_pinned(&dead_set);
+            LRU_STATS[3].fetch_add(unmade, Relaxed);
+        }
+        let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+        let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+        let all = textures();
+        for &at in all.iter() {
+            // SAFETY: a texture leaves the table before it is freed, under the
+            // lock held here (`Drop for Resource`).
+            let r = unsafe { &*(at as *const Resource) };
+            if !fills(&r.desc) || crate::texture::host_wrote(at) {
+                continue;
+            }
+            let gone = {
+                let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+                let idle = made.as_ref().is_some_and(|(host, _)| {
+                    crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                        && std::sync::Arc::strong_count(host) == 1
+                        && crate::host::references(&host.texture) == 1
+                });
+                if idle {
+                    crate::texture::unstage(at as This);
+                    made.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((host, _)) = gone {
+                r.host.gone.store(true, Relaxed);
+                KINDS[2].fetch_add(1, Relaxed);
+                KINDS[3].fetch_add(host.bytes, Relaxed);
+                went += 1;
+                bytes += host.bytes;
+                if first.is_none() {
+                    first = Some(at);
+                }
+                crate::host::retire(host);
+            }
+        }
+        if went > 0 {
+            crate::host::trail(|| {
+                format!(
+                    "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                    bytes >> 10,
+                    first.unwrap_or(0)
+                )
+            });
+        }
+        return;
+    }
+
+    let frame = crate::frame::current();
+    let min_idle_frames = lru_idle_frames();
+    let hard_idle_frames = min_idle_frames.saturating_mul(4).max(240);
+    let evict_residency = evict_residency_on();
+    let over_target_bytes = crate::host::host()
+        .and_then(|h| h.video_memory())
+        .map_or(0, |[budget, used, _, _]| {
+            let target = (budget / 100).saturating_mul(lru_target_pct());
+            used.saturating_sub(target)
+        });
+
+    // Phase 1: snapshot candidate state under `TEXTURES` -> `r.host.made` without
+    // touching descriptor heap locks.
+    let candidates = {
+        let mut out = Vec::new();
+        let all = textures();
+        for &at in all.iter() {
+            // SAFETY: a texture leaves `TEXTURES` before it is freed (`Drop for Resource`).
+            let r = unsafe { &*(at as *const Resource) };
+            if !fills(&r.desc) || crate::texture::host_wrote(at) {
+                continue;
+            }
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let Some((host, _)) = made.as_ref() else {
+                continue;
+            };
+            out.push(LruCandidate {
+                at,
+                host_id: host.id,
+                raw: windows::core::Interface::as_raw(&host.texture) as usize,
+                last_bound_frame: r.host.last_bound_frame.load(Relaxed),
+                bytes: host.bytes,
+                pinned: std::sync::Arc::strong_count(host) > 1
+                    || crate::host::references(&host.texture) > 1,
+                evicted: host.evicted.load(Relaxed),
+                evicted_frame: host.evicted_frame.load(Relaxed),
+                can_evict: host.tiled.is_none(),
+            });
+        }
+        out
+    };
+
+    let plan = plan_lru_evictions(
+        &candidates,
+        frame,
+        min_idle_frames,
+        hard_idle_frames,
+        over_target_bytes,
+        evict_residency,
+    );
+
+    // Phase 2: unpin descriptor slots outside `resource.rs` locks (`HostHeap::made` -> `kept`).
+    if !dead.is_empty() || plan.iter().any(|(c, _)| c.pinned) {
+        let mut unpin_targets: std::collections::HashSet<usize> = dead.into_iter().collect();
+        for (c, _) in &plan {
+            if c.pinned {
+                unpin_targets.insert(c.raw);
+            }
+        }
+        let unmade = crate::descriptor::host::unmake_pinned(&unpin_targets);
+        LRU_STATS[3].fetch_add(unmade, Relaxed);
+    }
+
+    if plan.is_empty() {
+        return;
+    }
+
+    // Phase 3: apply soft evictions / hard drops under `TEXTURES` -> `r.host.made`,
+    // re-checking `host.id`, `last_bound_frame`, and COM refcount == 1.
+    let (mut went, mut bytes, mut soft_went, mut soft_bytes, mut first) = (0u64, 0u64, 0u64, 0u64, None);
     let all = textures();
-    for &at in all.iter() {
-        // SAFETY: a texture leaves the table before it is freed, under the
-        // lock held here (`Drop for Resource`).
-        let r = unsafe { &*(at as *const Resource) };
-        if !fills(&r.desc) || crate::texture::host_wrote(at) {
+    for (cand, decision) in plan {
+        if !all.contains(&cand.at) {
             continue;
         }
+        // SAFETY: `cand.at` is still in `TEXTURES` under `all`'s lock.
+        let r = unsafe { &*(cand.at as *const Resource) };
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+            let still_eligible = made.as_ref().is_some_and(|(host, _)| {
+                host.id == cand.host_id
+                    && frame.saturating_sub(r.host.last_bound_frame.load(Relaxed)) >= min_idle_frames
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
-            if idle {
-                // Under the lock: the next use must not find the staging
-                // state of the texture let go (it says "uploaded").
-                crate::texture::unstage(at as This);
-                made.take()
-            } else {
+            if !still_eligible {
                 None
+            } else if decision == LruDecision::SoftEvict
+                && made.as_ref().is_some_and(|(host, _)| !host.evicted.load(Relaxed) && host.tiled.is_none())
+            {
+                let soft_ok = made.as_ref().is_some_and(|(host, _)| {
+                    crate::host::host().is_some_and(|h| {
+                        let Ok(pageable) = windows::core::Interface::cast::<
+                            windows::Win32::Graphics::Direct3D12::ID3D12Pageable,
+                        >(&host.texture) else {
+                            return false;
+                        };
+                        // SAFETY: `host.texture` has no in-flight or descriptor references.
+                        unsafe { h.device.Evict(&[Some(pageable)]).is_ok() }
+                    })
+                });
+                if soft_ok {
+                    if let Some((host, _)) = made.as_ref() {
+                        host.evicted.store(true, Relaxed);
+                        host.evicted_frame.store(frame, Relaxed);
+                        EVICTED_VRAM.fetch_add(host.bytes, Relaxed);
+                        HOST_TEXTURES[1].fetch_sub(host.bytes, Relaxed);
+                        if host.filled {
+                            KINDS[1].fetch_sub(host.bytes, Relaxed);
+                        }
+                        LRU_STATS[0].fetch_add(1, Relaxed);
+                        soft_went += 1;
+                        soft_bytes += host.bytes;
+                    }
+                    None
+                } else {
+                    crate::texture::unstage(cand.at as This);
+                    made.take()
+                }
+            } else {
+                crate::texture::unstage(cand.at as This);
+                made.take()
             }
         };
-        if let Some((host, _)) = gone {
+        if let Some((host, twin)) = gone {
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
+            if !host.evicted.load(Relaxed) {
+                KINDS[3].fetch_add(host.bytes, Relaxed);
+            }
+            LRU_STATS[2].fetch_add(1, Relaxed);
             went += 1;
             bytes += host.bytes;
             if first.is_none() {
-                first = Some(at);
+                first = Some(cand.at);
             }
             crate::host::retire(host);
+            if let Some(twin) = twin {
+                crate::host::retire(twin);
+            }
         }
     }
-    if went > 0 {
+    if went > 0 || soft_went > 0 {
         crate::host::trail(|| {
             format!(
-                "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
+                "sweep LRU: {soft_went} soft-evicted ({} KiB), {went} hard-dropped ({} KiB); first dropped: title texture {:#x}",
+                soft_bytes >> 10,
                 bytes >> 10,
                 first.unwrap_or(0)
             )
@@ -1989,6 +2350,24 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 }
 
 #[cfg(windows)]
+static NEXT_HOST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Unique ID of title texture `this`'s current host copy, if one exists.
+/// Does not create one and does not count as a use.
+#[cfg(windows)]
+pub(crate) fn host_id(this: This) -> Option<u64> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    made.as_ref().map(|(h, _)| h.id)
+}
+
+#[cfg(windows)]
 impl HostTexture {
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1996,11 +2375,14 @@ impl HostTexture {
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
+            id: NEXT_HOST_ID.fetch_add(1, Relaxed),
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
             tiled: None,
+            evicted: std::sync::atomic::AtomicBool::new(false),
+            evicted_frame: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2011,13 +2393,17 @@ impl HostTexture {
         state: u32,
         tiled: crate::tiles::Tiled,
     ) -> HostTexture {
-        HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HostTexture {
+            id: NEXT_HOST_ID.fetch_add(1, Relaxed),
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
+            evicted: std::sync::atomic::AtomicBool::new(false),
+            evicted_frame: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -2026,11 +2412,21 @@ impl HostTexture {
 impl Drop for HostTexture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        use windows::core::Interface;
+        crate::host::invalidate_views(self.texture.as_raw() as usize);
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
-        HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
+        if self.evicted.load(Relaxed) {
+            EVICTED_VRAM.fetch_sub(self.bytes, Relaxed);
+        } else {
+            HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
+            if self.filled {
+                KINDS[0].fetch_sub(1, Relaxed);
+                KINDS[1].fetch_sub(self.bytes, Relaxed);
+            }
+            return;
+        }
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
-            KINDS[1].fetch_sub(self.bytes, Relaxed);
         }
     }
 }
@@ -2328,6 +2724,18 @@ fn host_texture_as(
                     }
                 }
             }
+            Err(e) if bc_align() && is_bc(d.format) && (!d.width.is_multiple_of(4) || !d.height.is_multiple_of(4)) => {
+                let mut padded = d;
+                padded.width = padded.width.next_multiple_of(4);
+                padded.height = padded.height.next_multiple_of(4);
+                match allocate(&padded, clear_value.as_ref()) {
+                    Ok(texture) => texture,
+                    Err(_) => {
+                        tracing::warn!(error = %e, desc = ?d, "no host texture");
+                        None
+                    }
+                }
+            }
             Err(e) => {
                 tracing::warn!(error = %e, desc = ?d, "no host texture");
                 None
@@ -2472,6 +2880,7 @@ fn hand_out_resource(
             // then color or depth and stencil: 5 words) or null.
             clear: (!clear.is_null()).then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() }),
             used: std::sync::atomic::AtomicU64::new(0),
+            last_bound_frame: std::sync::atomic::AtomicU64::new(0),
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
@@ -2541,8 +2950,14 @@ impl Drop for Resource {
             }
         }
         // A running submission may still read the host copy (and a depth
-        // texture's colour twin).
+        // texture's colour twin). Unpin stale descriptor slots if any remain.
         if let Some((host, twin)) = made {
+            if crate::host::references(&host.texture) > 1 {
+                DEAD_TEXTURES
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(windows::core::Interface::as_raw(&host.texture) as usize);
+            }
             crate::host::retire(host);
             if let Some(twin) = twin {
                 crate::host::retire(twin);
@@ -4231,5 +4646,99 @@ float4 lit() : SV_Target { return 1.0; }
         }
         assert!(is_typeless(60));
         assert!(!is_typeless(65));
+    }
+
+    #[test]
+    fn non_multiple_of_4_bc_texture_aligns_host_copy() {
+        let Some(_) = crate::host::host() else {
+            return;
+        };
+        let desc = ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: 6,
+            height: 6,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 98, // BC7_UNORM
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        };
+        let tex = super::host_texture(&desc, 0, std::ptr::null(), 0).unwrap();
+        // SAFETY: live resource.
+        let got = unsafe { tex.GetDesc() };
+        assert!(got.Width >= 6 && got.Height >= 6);
+        assert!(super::is_bc(98));
+        assert!(!super::is_bc(28));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lru_policy_keeps_every_frame_textures_and_evicts_oldest_first() {
+        let mk = |at, last_bound_frame, bytes, pinned| LruCandidate {
+            at,
+            host_id: at as u64,
+            raw: at,
+            last_bound_frame,
+            bytes,
+            pinned,
+            evicted: false,
+            evicted_frame: 0,
+            can_evict: true,
+        };
+        let candidates = [
+            mk(1, 100, 4 << 20, true),  // bound this frame
+            mk(2, 99, 4 << 20, true),   // bound previous frame (every-frame)
+            mk(3, 41, 4 << 20, false),  // 59 frames idle (< 60)
+            mk(4, 40, 10 << 20, true),  // 60 frames idle, newer than 5
+            mk(5, 10, 20 << 20, true),  // 90 frames idle, oldest
+        ];
+
+        // Under budget target with residency eviction enabled: oldest first, soft-evicted.
+        let plan = plan_lru_evictions(&candidates, 100, 60, 240, 0, true);
+        assert_eq!(
+            plan.iter().map(|(c, d)| (c.at, *d)).collect::<Vec<_>>(),
+            vec![(5, LruDecision::SoftEvict), (4, LruDecision::SoftEvict)]
+        );
+
+        // Over budget target by 15 MiB: oldest (20 MiB) hard-drops to meet target, next soft-evicts.
+        let plan_over = plan_lru_evictions(&candidates, 100, 60, 240, 15 << 20, true);
+        assert_eq!(
+            plan_over.iter().map(|(c, d)| (c.at, *d)).collect::<Vec<_>>(),
+            vec![(5, LruDecision::HardDrop), (4, LruDecision::SoftEvict)]
+        );
+
+        // Residency eviction off: both hard-drop in LRU order.
+        let plan_hard = plan_lru_evictions(&candidates, 100, 60, 240, 0, false);
+        assert_eq!(
+            plan_hard.iter().map(|(c, d)| (c.at, *d)).collect::<Vec<_>>(),
+            vec![(5, LruDecision::HardDrop), (4, LruDecision::HardDrop)]
+        );
+
+        // Even with N = 1 (clamped to 2), a texture bound at frame 99 stays alive at frame 100.
+        let plan_min = plan_lru_evictions(&candidates, 100, 1, 240, 0, true);
+        assert!(plan_min.iter().all(|(c, _)| c.at != 1 && c.at != 2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lru_policy_hard_drops_soft_evicted_after_hard_idle_frames() {
+        let evicted = LruCandidate {
+            at: 10,
+            host_id: 10,
+            raw: 10,
+            last_bound_frame: 10,
+            bytes: 8 << 20,
+            pinned: false,
+            evicted: true,
+            evicted_frame: 20,
+            can_evict: true,
+        };
+        assert!(plan_lru_evictions(&[evicted], 259, 60, 240, 0, true).is_empty());
+        let plan = plan_lru_evictions(&[evicted], 260, 60, 240, 0, true);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].1, LruDecision::HardDrop);
     }
 }

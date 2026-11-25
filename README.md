@@ -12,11 +12,12 @@ decrypts anything or works around any protection, and no game files are included
 | Boot, intro video, start screen, menus | work |
 | Loading into the world | works, no failed DirectStorage reads |
 | The world (prologue) | drawn and lit; characters complete; **textures almost all complete** |
-| Speed in the world | **3.0-3.3 fps** (306-340 ms/frame), Series X mode, no upscaling |
+| Speed in the world | **2.9-3.3 fps** (306-348 ms/frame), Series X mode, no upscaling |
 | Stability | 17 min in the world without a crash or device removal |
 | Memory | about 28 GB committed |
 
-Still wrong: some faces not perfect, low frame rate (CPU and GPU still wait for each other: being worked on).
+Still wrong: low frame rate (CPU and GPU still wait for each other: being worked on); areas lit only by the
+title's ray-traced light stay dark (its structure builders are not run yet).
 
 ## What this build adds
 
@@ -25,11 +26,16 @@ Still wrong: some faces not perfect, low frame rate (CPU and GPU still wait for 
 - **Textures:** uploaded placed textures are refreshed when DirectStorage writes their pages after the upload (walls
   and details that stayed missing for a whole run); higher mips written later reach the card; sharper views are not
   held back when the card is full; XOR-swizzled textures are uploaded; sRGB/SNORM view formats kept on castable
-  copies (`VICTORY_TEXTURE_CAST=1`, off by default while it is tested).
+  copies (`VICTORY_TEXTURE_CAST`, on; an A8_UNORM view that removed the device is fixed); planar
+  depth-stencil planes and block-compressed sizes that are not multiples of 4 are uploaded.
 - **CPU/GPU waits:** settles for title memory changed under shader writes ask the page guards instead of assuming a
-  write (`VICTORY_STALE_ASK=1`), and wait only for the submissions concerned (`VICTORY_STALE_PRECISE=1`).
-- **Copies (being tested):** `VICTORY_CARD_FETCH_INFLIGHT=1`, `VICTORY_RELAY_WIDE_MERGE=1`, `VICTORY_COPY_DIFF=1`,
-  `VICTORY_HEAP_PASS_WIDE=1`.
+  write (`VICTORY_STALE_ASK`, on), and can wait only for the submissions concerned (`VICTORY_STALE_PRECISE=1`).
+- **Being tested, off by default** (one of them dims interior or reflected light, being narrowed down): copies
+  (`VICTORY_CARD_FETCH_INFLIGHT`, `VICTORY_RELAY_WIDE_MERGE`, `VICTORY_COPY_DIFF`, `VICTORY_HEAP_PASS_WIDE`), CPU recording
+  caches (`VICTORY_DRAW_STATE_CACHE`, `VICTORY_TABLE_CACHE`, `VICTORY_RECORD_PARALLEL`, timings `VICTORY_RECORD_TIMING`),
+  video memory (`VICTORY_UPLOAD_POOL`, `VICTORY_READBACK_POOL`, `VICTORY_READ_POOL`, `VICTORY_TEXTURE_KEEP_HASH`,
+  `VICTORY_TEXTURE_DROP_STAGING`, `VICTORY_TEXTURE_LRU`) and geometry (`VICTORY_MS_EXCHANGE`, `VICTORY_RAW_OWN_COPY`,
+  `VICTORY_HEAP_BUFFER_STATE`). Set one to `1` to try it.
 - `VICTORY_TITLE_DIR`: the folder with the game's files when the executable is elsewhere.
 
 ## Build and run
@@ -58,7 +64,6 @@ $env:VICTORY_WIDE_BACK = '1'
 $env:VICTORY_PIPELINE_WAIT_MS = '24'
 $env:VICTORY_RELAY_COPY_QUEUE = '0'
 $env:VICTORY_D3D12_DRED = '1'
-$env:VICTORY_STALE_ASK = '1'
 $env:VICTORY_GAME_DIR = '<game dir>'
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```

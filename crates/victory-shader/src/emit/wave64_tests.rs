@@ -530,3 +530,193 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+#[test]
+fn mesh_wave64_first_lane_reads_lane_zero_for_upper_half() {
+    use super::container::SigElement;
+    use super::host::Draw;
+    use crate::native::{MeshIo, PsInput, Usage, VsOutput};
+    let mut pos_el = SigElement {
+        name: "SV_Position".into(),
+        index: 0,
+        kind: 3,
+        comp: 9,
+        interp: 4,
+        row: Some(1),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    };
+    let tc_el = SigElement {
+        name: "TEXCOORD".into(),
+        index: 0,
+        kind: 0,
+        comp: 9,
+        interp: 2,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    };
+    let words: [u32; _] = [
+        0xD765_0000,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v0, -1, 0
+        0xD766_0000,
+        0x0002_00C1, // v_mbcnt_hi_u32_b32 v0, -1, v0
+        0x4A02_00FF,
+        100,         // v_add_nc_u32 v1, 100, v0
+        0x7E04_0501, // v_readfirstlane_b32 s2, v1
+        0xBE84_047E, // s_mov_b64 s[4:5], exec
+        0x7DA4_00A0, // v_cmpx_eq_u32 exec, 32, v0
+        0x7E04_0202, // v_mov_b32 v2, s2
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0xD834_0000,
+        0x0000_0203, // ds_write_b32 v3, v2
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+        0xBF8A_0000, // s_barrier
+        0xD8D8_0000,
+        0x0200_0003, // ds_read_b32 v2, v3
+        0x7E04_0D02, // v_cvt_f32_u32 v2, v2
+        0x7E08_02FF,
+        0xBF80_0000, // v_mov_b32 v4, -1.0
+        0x7E0A_02FF,
+        0xBF80_0000, // v_mov_b32 v5, -1.0
+        0x7E10_02FF,
+        0x4040_0000, // v_mov_b32 v8, 3.0
+        0x7D84_0081, // v_cmp_eq_u32 vcc, 1, v0
+        0x0208_1104, // v_cndmask_b32 v4, v4, v8
+        0x7D84_0082, // v_cmp_eq_u32 vcc, 2, v0
+        0x020A_1105, // v_cndmask_b32 v5, v5, v8
+        0x7E0C_02F0, // v_mov_b32 v6, 0.5
+        0x7E0E_02F2, // v_mov_b32 v7, 1.0
+        0xF800_00CF,
+        0x0706_0504, // exp pos0, v4, v5, v6, v7
+        0xF800_020F,
+        0x0702_0202, // exp param0, v2, v2, v2, v7
+        0x7E10_02FF,
+        0x0020_0400, // v_mov_b32 v8, (0 | (1 << 10) | (2 << 20))
+        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+        0xF800_0941,
+        0x0000_0008, // exp prim, v8, off, off, off done
+        0xBF81_0000, // s_endpgm
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = ir::build(&code, true, 16).expect("ir::build");
+    let native = NativeProgram {
+        stage: HwStage::Ms,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ms(MeshIo {
+            outputs: vec![VsOutput {
+                usage: Usage::Generic,
+                row: 0,
+                param: 0,
+                fp16: false,
+                pack2: false,
+            }],
+            clip_cntl: 0,
+            threads: 64,
+            max_vertices: 3,
+            max_primitives: 1,
+            topology: 2,
+            lds_bytes: 4,
+        }),
+        code,
+    };
+    let osg1 = super::container::signature(&[tc_el.clone(), pos_el.clone()], false);
+    let dxbc_ms = crate::dxbc::build(&[(crate::FourCC::OSG1, &osg1)]);
+    let c_ms = crate::Container::parse(&dxbc_ms).unwrap();
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("raise");
+    let (ms, _) = super::emit_program(&c_ms, &native, &p, &st, &io, &res).expect("emit ms");
+
+    // Simple pixel shader copying TEXCOORD0 to SV_Target0
+    pos_el.usage = 0;
+    let ps_words: [u32; _] = [
+        0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+        0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+        0x7E06_02F2, // v_mov_b32 v3, 1.0
+        0xF800_180F,
+        0x0302_0202, // exp mrt0, v2, v2, v2, v3 done vm
+        0xBF81_0000,
+    ];
+    let ps_code: Vec<u8> = ps_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let ps_p = ir::build(&ps_code, false, 8).unwrap();
+    let ps_nat = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: vec![PsInput {
+                usage: Usage::Generic,
+                row: 0,
+                mask: 0b1111,
+                attr: 0,
+                flat: false,
+                fp16: false,
+                pack2: false,
+                row2: 0,
+            }],
+            input_addr: 2,
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: ps_code,
+    };
+    let mut target = SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 15,
+        half: false,
+    };
+    target.usage = 15;
+    let isg1 = super::container::signature(&[tc_el], true);
+    let osg1_ps = super::container::signature(&[target], false);
+    let dxbc_ps = crate::dxbc::build(&[(crate::FourCC::ISG1, &isg1), (crate::FourCC::OSG1, &osg1_ps)]);
+    let c_ps = crate::Container::parse(&dxbc_ps).unwrap();
+    let ps_st = structure::structure(&ps_p).unwrap();
+    let ps_res = resource::track(&ps_p, &ps_nat.layout, ps_nat.stage, Some(&ps_st)).unwrap();
+    let ps_io = io::raise(&ps_p, &ps_nat).unwrap();
+    let (ps, _) = super::emit_program(&c_ps, &ps_nat, &ps_p, &ps_st, &ps_io, &ps_res).unwrap();
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut ms.dxil.clone()).expect("ms DXIL validation failed");
+        v.validate(&mut ps.dxil.clone()).expect("ps DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    };
+    let (root, pso) = host.mesh_pipeline(&ms, &ps).expect("mesh_pipeline");
+    let img = host
+        .draw(
+            &root,
+            &pso,
+            &Draw {
+                roots: vec![],
+                textures: &[],
+                samplers: &[],
+                vertices: &[],
+                stride: 0,
+                size: (4, 4),
+                mesh_groups: 1,
+            },
+        )
+        .expect("draw mesh");
+    eprintln!("mesh_wave64 first_lane from thread 32 = {:?}", img[0]);
+    assert_eq!(img[0][0], 100.0, "upper half read lane 32 ({}) instead of lane 0 (100.0)", img[0][0]);
+}

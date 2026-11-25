@@ -355,6 +355,10 @@ struct Pipeline {
     shaders: Vec<Arc<Shader>>,
     /// Whether a list has bound it yet (its shaders are logged then).
     bound: std::sync::atomic::AtomicBool,
+    /// Whether this pipeline is skipped by `VICTORY_SKIP_PIPELINES` or crashed
+    /// in a pre-build (immutable for the run).
+    #[cfg(windows)]
+    skipped: bool,
     /// What its host pipeline is made from, and the host pipeline once made
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
@@ -457,6 +461,9 @@ pub(crate) fn is_skipped(this: This) -> bool {
         return false;
     }
     let p = pipeline(this);
+    if crate::draw::draw_state_cache() {
+        return p.skipped;
+    }
     skipped_shader(&p.shaders).is_some() || library::crashed(&p.host.key)
 }
 
@@ -517,10 +524,12 @@ fn hand_out(
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    #[cfg(windows)]
+    let skipped = skipped_shader(&shaders).is_some() || library::crashed(&host.key);
     // A skipped shader's pipeline is never drawn with: not prewarmed either,
     // even if an earlier run's early-pipelines.txt lists it.
     #[cfg(windows)]
-    if skipped_shader(&shaders).is_none() && !library::crashed(&host.key) {
+    if !skipped {
         make::early(&host);
     }
     #[cfg(windows)]
@@ -537,6 +546,8 @@ fn hand_out(
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        skipped,
         #[cfg(windows)]
         builder,
         shaders,

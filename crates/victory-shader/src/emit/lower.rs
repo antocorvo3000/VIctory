@@ -1078,6 +1078,13 @@ fn host_pixel_wave() -> u32 {
     HOST_PIXEL_WAVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether console wave64 mesh shaders exchange first-lane reads across their
+/// two 32-lane halves through LDS (`VICTORY_MS_EXCHANGE=0` turns that off).
+pub(super) fn ms_exchange_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MS_EXCHANGE").is_some_and(|v| v == "1"))
+}
+
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
@@ -1547,6 +1554,16 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
+            // Console wave64 mesh shaders have no WaveSize(64) in SM 6.6 and
+            // run in host waves of 32 on RDNA2; exchange first-lane reads across
+            // the two halves of each 64-thread console wave via LDS.
+            if x.native.wave64 && ms_exchange_on() && !LOCAL_WAVES.get() {
+                let all = all_lane_blocks(x.st).unwrap_or_default();
+                exchange = Some((s.lds_dwords, ms.threads <= 32, all));
+                if ms.threads > 32 {
+                    s.lds_dwords += ms.threads.div_ceil(64) * 2;
+                }
+            }
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -3866,6 +3883,9 @@ impl<'a> Lower<'a> {
     /// The console thread index of this thread in the group: `wave_base` plus the host lane
     /// (host waves of 32), else the wave's first thread index rounded down plus the lane.
     fn console_thread(&mut self) -> V {
+        if self.s.mesh.is_some() {
+            return self.mesh_thread();
+        }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         if let Some(base) = self.wave_base() {
