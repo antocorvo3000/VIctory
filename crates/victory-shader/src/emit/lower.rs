@@ -7592,6 +7592,15 @@ impl<'a> Lower<'a> {
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
         };
+        if matches!(op, 60 | 61)
+            && let StageIo::Cs(cs) = self.x.native.io
+        {
+            let [x, y, z] = cs.threads;
+            let linear_quads = y == 1 && z == 1 && x.is_multiple_of(4);
+            let tiled_quads = x.is_multiple_of(2) && y.is_multiple_of(2);
+            // Keep the existing validator target for incompatible groups.
+            self.s.compute_derivatives = linear_quads || tiled_quads;
+        }
         if op == 72 {
             // Width, height, depth or layers, levels (per dmask) of the level
             // in the first address: DXIL's dimensions; a channel DXIL leaves
@@ -9598,6 +9607,16 @@ mod tests {
         used: Vec<UsedResource>,
         wave64: bool,
     ) -> Result<Lowered, crate::ShaderError> {
+        lower_compute(words, layout, used, wave64, [1, 1, 1])
+    }
+
+    fn lower_compute(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        wave64: bool,
+        threads: [u32; 3],
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
         let native = NativeProgram {
@@ -9609,7 +9628,7 @@ mod tests {
             io: StageIo::Cs(ComputeIo {
                 // The layout's user SGPRs (at least two), 512 bytes of LDS.
                 rsrc2: 1 << 15 | sgprs.max(2) << 1,
-                threads: [1, 1, 1],
+                threads,
             }),
             code,
         };
@@ -9628,6 +9647,42 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
+    }
+
+    #[test]
+    fn implicit_compute_sampling_validates_with_quad_threads() {
+        use super::super::validator::Validator;
+
+        let words = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xBE84_0301, // s_mov_b32 s4, s1
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0201,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[2:3], null
+            0xF408_0402,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[4:5], null
+            0xF080_0F08,
+            0x0082_0400, // image_sample v[4:7], v[0:1], s[8:15], s[16:19]
+            0xD834_0000,
+            0x0000_0400, // ds_write_b32 v0, v4
+            S_ENDPGM,
+        ];
+        for (threads, runtime_info_size) in [([4, 1, 1], 52), ([2, 2, 1], 52), ([1, 1, 1], 48)] {
+            let (layout, used) = texture_tables();
+            let mut shader = lower_compute(&words, layout, used, false, threads).unwrap();
+            let container = crate::Container::parse(&shader.dxil).unwrap();
+            let psv = container.part(crate::FourCC::PSV0).unwrap();
+            assert_eq!(
+                u32::from_le_bytes(psv.data[..4].try_into().unwrap()),
+                runtime_info_size
+            );
+            if runtime_info_size == 52
+                && let Ok(mut validator) = Validator::load(Validator::default_path().as_deref())
+            {
+                validator.validate(&mut shader.dxil).unwrap();
+            }
+        }
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
