@@ -12,7 +12,7 @@ decrypts anything or works around any protection, and no game files are included
 | Boot, intro video, start screen, menus | work |
 | Loading into the world | works, no failed DirectStorage reads |
 | The world (prologue) | drawn and lit; characters complete; **textures almost all complete**; more of the scene drawn (about 5,900 draws a frame) |
-| Speed in the world | **2.3-3.3 fps** (more is drawn now: the GPU time is next), Series X mode, no upscaling |
+| Speed in the world | **2.6-3 fps** with up to ~6,800 draws a frame, Series X mode, no upscaling |
 | Stability | 17 min in the world without a crash or device removal |
 | Memory | about 28 GB committed |
 
@@ -21,8 +21,8 @@ Screenshots from my RX 6800 XT (prologue, Series X mode, 2-3 fps shown in the wi
 ![The cell at sunset, by the window](docs/screenshots/cell-window.png)
 ![The cell, sunlight on the wall](docs/screenshots/cell-sink.png)
 
-Still wrong: low frame rate (CPU and GPU still wait for each other: being worked on); areas lit only by the
-title's ray-traced light stay dark (its structure builders are not run yet).
+Still wrong: low frame rate (the submitting thread still waits for the card about 180 ms a frame: being worked on);
+the title's ray-traced light does not run yet, so a constant ambient light stands in for it (see below).
 
 ## What this build adds
 
@@ -45,6 +45,15 @@ title's ray-traced light stay dark (its structure builders are not run yet).
   (`VICTORY_CARD_FETCH_INFLIGHT`, `VICTORY_RELAY_WIDE_MERGE`, `VICTORY_COPY_DIFF`, `VICTORY_HEAP_PASS_WIDE`) and CPU
   recording caches (`VICTORY_DRAW_STATE_CACHE`, `VICTORY_TABLE_CACHE`, `VICTORY_RECORD_PARALLEL`, timings
   `VICTORY_RECORD_TIMING`). Set one to `1` to try it.
+- **Ambient light where ray-traced light does not run:** the output of the title's indirect diffuse resolve
+  (`CS_ScreenProbes_TemporalResolve`), which without rays holds garbage (magenta on leaves, cloth and paper, blocks of
+  colour indoors), is replaced by a constant (`VICTORY_AMBIENT=<level>`, 0.6 by default; `off` keeps the title's
+  output), with a tint (`VICTORY_AMBIENT_TINT=r,g,b`) and less of it in creases and under objects from the scene's
+  depth (`VICTORY_AMBIENT_SHADE=strength,radius`). Reflections are held to part of it after the last reflection
+  pass (`VICTORY_AMBIENT_REFLECT`, 0.5; without rays they showed the open sky indoors).
+- **Indirect draw windows (on):** consecutive indirect records are clamped once per window instead of one by one
+  (`VICTORY_INDIRECT_WINDOW=0` turns it off): GPU time about 220 to 150-180 ms a frame here.
+- **Release build:** thin LTO and one codegen unit.
 - `VICTORY_TITLE_DIR`: the folder with the game's files when the executable is elsewhere.
 
 ## Build and run
