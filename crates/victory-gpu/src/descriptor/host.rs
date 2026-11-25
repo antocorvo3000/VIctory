@@ -616,13 +616,12 @@ impl HostHeap {
             self.note_address(index, Some(&view));
             // Shaders index the heap itself (`crate::bindless`): buffer views
             // are made when written.
-            // shortcut: views of textures the title placed itself are made
-            // when a draw reads them through a table: a host texture (and a
-            // staging copy) for each of the ~20,000 the title has views of
-            // ran the host out of memory (run b2).
-            // Local experiment: VICTORY_HEAP_PLACED_TEXTURES=1 makes them
-            // at once, for shaders that index the heap (materials whose
-            // albedo came out black: their textures were null slots).
+            // Placed textures: when VICTORY_HEAP_PLACED_TEXTURES is on (the
+            // default), their heap slots are made immediately so shaders that
+            // index the heap find them (not just draws that read a table).
+            // `texture_at` dedupes by (address, desc) and enforces a byte
+            // budget; slots past the budget stay null as today.
+            // =0 restores the old shortcut (made only for_draw through a table).
             let later = !for_draw && is_placed_texture(&view) && !heap_placed_textures();
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
@@ -1174,10 +1173,17 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
-/// Whether `view` is a view of a texture the title placed in memory itself.
+/// Whether heap slots for placed textures are made immediately (not deferred
+/// to the first draw that reads them through a table).  On by default;
+/// set `VICTORY_HEAP_PLACED_TEXTURES=0` to restore the old shortcut (slots
+/// stay null until the draw reads them, reproducing the black-albedo bug).
 fn heap_placed_textures() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_PLACED_TEXTURES").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_PLACED_TEXTURES")
+            .map(|v| v != "0")
+            .unwrap_or(true) // ON by default
+    })
 }
 
 fn is_placed_texture(view: &View) -> bool {

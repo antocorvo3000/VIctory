@@ -1584,16 +1584,79 @@ pub(crate) extern "system" fn create_at_address(
 /// Textures the title placed in its own memory and views without a
 /// resource object (device 0x230, Grand Theft Auto VI's streamed and
 /// interface textures), by address and description: a resource at that
-/// address, made the first time a draw reads one.
-/// shortcut: never released (one host texture per distinct address and
-/// description viewed); release them when the title unmaps or reuses the
-/// memory once streaming grows VRAM use.
+/// address, made the first time a view is mirrored for the heap.
+/// Deduped: many heap slots that view the same (address, desc) share one
+/// resource object and one host texture.
 #[cfg(windows)]
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
+/// Host-texture bytes charged so far for placed textures (from the
+/// descriptor: width × height × depth × array × mips × bytes-per-texel,
+/// block formats included).  Atomically updated under `PLACED_TEXTURES`.
+#[cfg(windows)]
+static PLACED_TEXTURE_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Slots whose placed-texture host view was skipped because the byte
+/// budget was exhausted (reported in the bindless log line).
+#[cfg(windows)]
+pub(crate) static PLACED_TEXTURE_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Budget bytes for placed-texture host textures (default 6 000 MB).
+/// Each distinct (address, desc) is counted once using
+/// `placed_texture_bytes`; slots beyond the budget stay null.
+/// Override with `VICTORY_HEAP_TEXTURE_MB=<n>`.
+#[cfg(windows)]
+fn placed_texture_budget() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_TEXTURE_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(6_000)
+            * 1_000_000 // MB → bytes (1 000 000 not 1 048 576: easy mental arithmetic)
+    })
+}
+
+/// Conservative byte count for a placed texture from its console resource
+/// description: width × height × depth_or_array × mip_chain × bytes-per-texel.
+/// Used for budget accounting only; not the exact host allocation size.
+#[cfg(windows)]
+pub(crate) fn placed_texture_bytes(desc: &ResourceDesc) -> u64 {
+    let Some((element, block)) = element(desc.format) else {
+        return 0;
+    };
+    let (depth, slices) = if desc.dimension == TEXTURE_3D {
+        (u64::from(desc.depth_or_array_size), 1u64)
+    } else {
+        (1u64, u64::from(desc.depth_or_array_size).max(1))
+    };
+    let height = u64::from(desc.height).max(1);
+    let mips = u64::from(mip_count(desc)).max(1);
+    // Sum the mip chain in one axis, multiply by the other dimensions.
+    // This is an over-count for block-compressed mips smaller than a block,
+    // which is fine for a budget check.
+    let mut chain: u64 = 0;
+    for mip in 0..mips.min(64) {
+        let w = (desc.width >> mip).max(1).div_ceil(block);
+        let h = (height >> mip).max(1).div_ceil(block);
+        let d = (depth >> mip).max(1);
+        chain = chain.saturating_add(
+            w.saturating_mul(h)
+                .saturating_mul(d)
+                .saturating_mul(element),
+        );
+    }
+    chain.saturating_mul(slices)
+}
+
 /// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
+/// description `desc` (as words), made on first use and gated by the
+/// byte budget.  Returns `None` when the budget is exhausted (slot stays
+/// null) or no host texture could be made.
+/// Deduped: the same (address, desc) reuses the existing resource.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1615,6 +1678,16 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if d.dimension == BUFFER {
         return None;
     }
+    // Budget gate: count bytes once per distinct (address, desc), not per
+    // heap slot.  `placed_texture_bytes` uses the same formula as the host
+    // GPU allocation (element × mip chain × slices × depth).
+    let cost = placed_texture_bytes(&d);
+    let budget = placed_texture_budget();
+    let used = PLACED_TEXTURE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    if cost > 0 && used.saturating_add(cost) > budget {
+        PLACED_TEXTURE_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
     let mut out = std::ptr::null();
     let made = create_at_address(
         std::ptr::null(),
@@ -1627,6 +1700,10 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     );
     if made != S_OK {
         return None;
+    }
+    // Charge the budget now that the resource was made successfully.
+    if cost > 0 {
+        PLACED_TEXTURE_BYTES.fetch_add(cost, std::sync::atomic::Ordering::Relaxed);
     }
     map.insert((address, *desc), out as usize);
     resource(out).host.is_some().then_some(out)
@@ -2332,5 +2409,111 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    // ── placed-texture byte-budget helpers ──────────────────────────────────
+
+    fn tex2d(width: u64, height: u32, format: u32, mips: u16, array: u16) -> ResourceDesc {
+        ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width,
+            height,
+            depth_or_array_size: array,
+            mip_levels: mips,
+            format,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 0,
+            flags: 0,
+        }
+    }
+
+    /// `placed_texture_bytes` counts bytes correctly for a simple RGBA8
+    /// (format 28, 4 bytes/texel) texture without mipmaps.
+    #[test]
+    fn placed_texture_bytes_flat() {
+        // 256 × 128 × 1 × 1 array × 1 mip × 4 B/texel = 131072
+        let d = tex2d(256, 128, 28, 1, 1);
+        assert_eq!(placed_texture_bytes(&d), 256 * 128 * 4);
+    }
+
+    /// A mip chain (1 mip → ½ → ¼ → …) sums as expected.
+    #[test]
+    fn placed_texture_bytes_mip_chain() {
+        // 4 × 4, format 28 (4 B), 3 mips: 4×4 + 2×2 + 1×1 = 16+4+1 = 21 × 4 = 84
+        let d = tex2d(4, 4, 28, 3, 1);
+        assert_eq!(placed_texture_bytes(&d), (4 * 4 + 2 * 2 + 1 * 1) * 4);
+    }
+
+    /// A block-compressed texture (BC1 / format 71, 8 B per 4×4 block).
+    #[test]
+    fn placed_texture_bytes_block_compressed() {
+        // 8 × 8 BC1 (format 71, 8 bytes/block, block=4): 2×2 blocks = 4 blocks × 8 = 32
+        let d = tex2d(8, 8, 71, 1, 1);
+        let (bytes_per_block, block) = element(71).unwrap();
+        assert_eq!(block, 4);
+        let blocks_w = 8u64.div_ceil(block);
+        let blocks_h = 8u64.div_ceil(block);
+        assert_eq!(placed_texture_bytes(&d), blocks_w * blocks_h * bytes_per_block);
+    }
+
+    /// An array texture multiplies by slice count.
+    #[test]
+    fn placed_texture_bytes_array() {
+        // 4 × 4 × 6 array slices, format 28, 1 mip: 4*4*4 * 6 = 384
+        let d = tex2d(4, 4, 28, 1, 6);
+        assert_eq!(placed_texture_bytes(&d), 4 * 4 * 4 * 6);
+    }
+
+    /// An unknown format (0) gives 0 bytes, never panics.
+    #[test]
+    fn placed_texture_bytes_unknown_format() {
+        let d = tex2d(1024, 1024, 0, 1, 1);
+        assert_eq!(placed_texture_bytes(&d), 0);
+    }
+
+    /// `texture_at` dedupes: two calls with the same address and desc return
+    /// the same resource pointer.
+    #[cfg(windows)]
+    #[test]
+    fn texture_at_dedupes() {
+        // A tiny committed buffer gives us a valid address in title memory;
+        // we describe it as a 4×4 texture.
+        let memory = vec![0u8; 0x10000];
+        let address = memory.as_ptr() as u64;
+        // 4×4 R8G8B8A8 (format 28, 4 B) in linear layout (0x101):
+        let desc: [u32; 14] = [
+            3, 0, 0, 0,                   // dimension=2D, alignment lo/hi
+            4, 0,                          // width lo/hi
+            4,                             // height
+            (1u32) | (1u32 << 16),        // depth_or_array=1, mip_levels=1
+            28,                            // format
+            1, 0,                          // sample_count, sample_quality
+            0x101, 0, 0,                   // layout=linear, flags, padding
+        ];
+        let a = texture_at(address, &desc);
+        let b = texture_at(address, &desc);
+        // Both must be the same pointer (or both None when no GPU).
+        assert_eq!(a, b, "texture_at must dedupe same (address, desc)");
+    }
+
+    /// Different addresses produce different resources.
+    #[cfg(windows)]
+    #[test]
+    fn texture_at_different_addresses() {
+        let mem_a = vec![0u8; 0x10000];
+        let mem_b = vec![0u8; 0x10000];
+        let (addr_a, addr_b) = (mem_a.as_ptr() as u64, mem_b.as_ptr() as u64);
+        let desc: [u32; 14] = [
+            3, 0, 0, 0, 4, 0, 4,
+            (1u32) | (1u32 << 16),
+            28, 1, 0, 0x101, 0, 0,
+        ];
+        let a = texture_at(addr_a, &desc);
+        let b = texture_at(addr_b, &desc);
+        if a.is_some() && b.is_some() {
+            assert_ne!(a.unwrap(), b.unwrap(), "different addresses → different resources");
+        }
     }
 }

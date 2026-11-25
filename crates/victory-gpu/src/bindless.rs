@@ -301,6 +301,9 @@ pub(crate) fn log(frames: f64) {
     let [draws, writes] = [0, 1].map(|i| HEAP_DRAWS[i].swap(0, Relaxed) as f64 / frames);
     let uploaded = UPLOADED.swap(0, Relaxed) as f64 / frames;
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    // Placed-texture budget stats (cumulative, not per-frame).
+    let placed_mb = crate::resource::PLACED_TEXTURE_BYTES.load(Relaxed) as f64 / 1e6;
+    let placed_skipped = crate::resource::PLACED_TEXTURE_SKIPPED.load(Relaxed);
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut left = [0u32; KINDS.len()];
@@ -330,7 +333,8 @@ pub(crate) fn log(frames: f64) {
             "heap views: {draws:.0} draws/frame index the heap ({writes:.0} writing through it), \
              {uploaded:.0} textures uploaded/frame; slots: {buffers} buffer views ({} ranges, \
              {:.1} MB, {copies} copies), {textures} title-written textures ({} distinct); \
-             left null: {}; host copies of title memory: {} ({:.1} MB); hulls {:.1} MB, unordered {:.1} MB",
+             left null: {}; placed textures: {placed_mb:.1} MB charged, {placed_skipped} over budget; \
+             host copies of title memory: {} ({:.1} MB); hulls {:.1} MB, unordered {:.1} MB",
             inner.ranges.len(),
             bytes as f64 / 1e6,
             inner.textures.len(),
