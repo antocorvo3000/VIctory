@@ -11,8 +11,8 @@ decrypts anything or works around any protection, and no game files are included
 |---|---|
 | Boot, intro video, start screen, menus | work |
 | Loading into the world | works, no failed DirectStorage reads |
-| The world (prologue) | drawn and lit; characters complete; **textures almost all complete** |
-| Speed in the world | **2.9-3.3 fps** (306-348 ms/frame), Series X mode, no upscaling |
+| The world (prologue) | drawn and lit; characters complete; **textures almost all complete**; more of the scene drawn (about 5,900 draws a frame) |
+| Speed in the world | **2.3-3.3 fps** (more is drawn now: the GPU time is next), Series X mode, no upscaling |
 | Stability | 17 min in the world without a crash or device removal |
 | Memory | about 28 GB committed |
 
@@ -35,12 +35,16 @@ title's ray-traced light stay dark (its structure builders are not run yet).
   depth-stencil planes and block-compressed sizes that are not multiples of 4 are uploaded.
 - **CPU/GPU waits:** settles for title memory changed under shader writes ask the page guards instead of assuming a
   write (`VICTORY_STALE_ASK`, on), and can wait only for the submissions concerned (`VICTORY_STALE_PRECISE=1`).
-- **Being tested, off by default** (one of them dims interior or reflected light, being narrowed down): copies
-  (`VICTORY_CARD_FETCH_INFLIGHT`, `VICTORY_RELAY_WIDE_MERGE`, `VICTORY_COPY_DIFF`, `VICTORY_HEAP_PASS_WIDE`), CPU recording
-  caches (`VICTORY_DRAW_STATE_CACHE`, `VICTORY_TABLE_CACHE`, `VICTORY_RECORD_PARALLEL`, timings `VICTORY_RECORD_TIMING`),
-  video memory (`VICTORY_UPLOAD_POOL`, `VICTORY_READBACK_POOL`, `VICTORY_READ_POOL`, `VICTORY_TEXTURE_KEEP_HASH`,
-  `VICTORY_TEXTURE_DROP_STAGING`, `VICTORY_TEXTURE_LRU`) and geometry (`VICTORY_MS_EXCHANGE`, `VICTORY_RAW_OWN_COPY`,
-  `VICTORY_HEAP_BUFFER_STATE`). Set one to `1` to try it.
+- **Video memory and geometry (on):** pooled upload/readback buffers, kept texture hashes (a texture is checked for
+  title writes when the list is recorded, so a rewritten one is uploaded in the same frame), staging buffers dropped
+  after rare uploads, LRU eviction only while the card is over its target and never for a texture a view slot still
+  names; wave64 mesh shaders exchange first-lane reads across their two 32-lane halves (web triangles and deformed
+  faces); read-only raw views off 16-byte alignment get their own copy (writable ones stay on the shared copy); heap
+  buffer reads wait for the UAV writes before them (skinned characters). `VICTORY_<NAME>=0` turns each off.
+- **Off by default** (no speed gain measured, one of them dims reflected light): copies
+  (`VICTORY_CARD_FETCH_INFLIGHT`, `VICTORY_RELAY_WIDE_MERGE`, `VICTORY_COPY_DIFF`, `VICTORY_HEAP_PASS_WIDE`) and CPU
+  recording caches (`VICTORY_DRAW_STATE_CACHE`, `VICTORY_TABLE_CACHE`, `VICTORY_RECORD_PARALLEL`, timings
+  `VICTORY_RECORD_TIMING`). Set one to `1` to try it.
 - `VICTORY_TITLE_DIR`: the folder with the game's files when the executable is elsewhere.
 
 ## Build and run

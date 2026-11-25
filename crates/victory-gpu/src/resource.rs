@@ -1886,7 +1886,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 #[cfg(windows)]
 fn lru_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LRU").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LRU").is_none_or(|v| v != "0"))
 }
 
 #[cfg(windows)]
@@ -1962,10 +1962,18 @@ fn plan_lru_evictions(
     evict_residency: bool,
 ) -> Vec<(LruCandidate, LruDecision)> {
     let min_idle = min_idle_frames.max(2);
+    // Only under real pressure: the card over its target. Textures read through
+    // the view heap are bound once and then sampled every frame without a new
+    // bind, so `last_bound_frame` says nothing about them: a texture still
+    // named by a descriptor slot (`pinned`) is never a candidate (unmaking its
+    // slot left shaders reading a null view: interior light went black).
+    if over_target_bytes == 0 {
+        return Vec::new();
+    }
     let mut eligible: Vec<LruCandidate> = candidates
         .iter()
         .copied()
-        .filter(|c| frame.saturating_sub(c.last_bound_frame) >= min_idle)
+        .filter(|c| !c.pinned && frame.saturating_sub(c.last_bound_frame) >= min_idle)
         .collect();
     eligible.sort_by_key(|c| (c.last_bound_frame, c.pinned, c.at));
 
@@ -1978,9 +1986,9 @@ fn plan_lru_evictions(
             }
             continue;
         }
-        let hard = !evict_residency
-            || !c.can_evict
-            || freed_resident < over_target_bytes;
+        // Soft (residency eviction keeps the contents) where the host can;
+        // a hard drop otherwise.
+        let hard = !evict_residency || !c.can_evict;
         let decision = if hard {
             LruDecision::HardDrop
         } else {
@@ -1988,6 +1996,9 @@ fn plan_lru_evictions(
         };
         freed_resident = freed_resident.saturating_add(c.bytes);
         plan.push((c, decision));
+        if freed_resident >= over_target_bytes {
+            break;
+        }
     }
     plan
 }
@@ -4689,37 +4700,42 @@ float4 lit() : SV_Target { return 1.0; }
             can_evict: true,
         };
         let candidates = [
-            mk(1, 100, 4 << 20, true),  // bound this frame
-            mk(2, 99, 4 << 20, true),   // bound previous frame (every-frame)
+            mk(1, 100, 4 << 20, false), // bound this frame
+            mk(2, 99, 4 << 20, false),  // bound previous frame (every-frame)
             mk(3, 41, 4 << 20, false),  // 59 frames idle (< 60)
-            mk(4, 40, 10 << 20, true),  // 60 frames idle, newer than 5
-            mk(5, 10, 20 << 20, true),  // 90 frames idle, oldest
+            mk(4, 40, 10 << 20, false), // 60 frames idle, newer than 5
+            mk(5, 10, 20 << 20, false), // 90 frames idle, oldest
+            mk(6, 5, 30 << 20, true),   // oldest of all, but still named by a view slot
         ];
 
-        // Under budget target with residency eviction enabled: oldest first, soft-evicted.
-        let plan = plan_lru_evictions(&candidates, 100, 60, 240, 0, true);
-        assert_eq!(
-            plan.iter().map(|(c, d)| (c.at, *d)).collect::<Vec<_>>(),
-            vec![(5, LruDecision::SoftEvict), (4, LruDecision::SoftEvict)]
-        );
+        // Card under its target: nothing is let go, however idle.
+        assert!(plan_lru_evictions(&candidates, 100, 60, 240, 0, true).is_empty());
 
-        // Over budget target by 15 MiB: oldest (20 MiB) hard-drops to meet target, next soft-evicts.
+        // Over the target by 15 MiB: the oldest unpinned idle texture (20 MiB)
+        // is enough; the pinned one is never taken.
         let plan_over = plan_lru_evictions(&candidates, 100, 60, 240, 15 << 20, true);
         assert_eq!(
             plan_over.iter().map(|(c, d)| (c.at, *d)).collect::<Vec<_>>(),
-            vec![(5, LruDecision::HardDrop), (4, LruDecision::SoftEvict)]
+            vec![(5, LruDecision::SoftEvict)]
         );
 
-        // Residency eviction off: both hard-drop in LRU order.
-        let plan_hard = plan_lru_evictions(&candidates, 100, 60, 240, 0, false);
+        // Over by 25 MiB: oldest first until enough is freed.
+        let plan_more = plan_lru_evictions(&candidates, 100, 60, 240, 25 << 20, true);
+        assert_eq!(
+            plan_more.iter().map(|(c, d)| (c.at, *d)).collect::<Vec<_>>(),
+            vec![(5, LruDecision::SoftEvict), (4, LruDecision::SoftEvict)]
+        );
+
+        // Residency eviction off: hard drops in LRU order.
+        let plan_hard = plan_lru_evictions(&candidates, 100, 60, 240, 25 << 20, false);
         assert_eq!(
             plan_hard.iter().map(|(c, d)| (c.at, *d)).collect::<Vec<_>>(),
             vec![(5, LruDecision::HardDrop), (4, LruDecision::HardDrop)]
         );
 
         // Even with N = 1 (clamped to 2), a texture bound at frame 99 stays alive at frame 100.
-        let plan_min = plan_lru_evictions(&candidates, 100, 1, 240, 0, true);
-        assert!(plan_min.iter().all(|(c, _)| c.at != 1 && c.at != 2));
+        let plan_min = plan_lru_evictions(&candidates, 100, 1, 240, 1 << 40, true);
+        assert!(plan_min.iter().all(|(c, _)| c.at != 1 && c.at != 2 && c.at != 6));
     }
 
     #[cfg(windows)]
@@ -4736,8 +4752,8 @@ float4 lit() : SV_Target { return 1.0; }
             evicted_frame: 20,
             can_evict: true,
         };
-        assert!(plan_lru_evictions(&[evicted], 259, 60, 240, 0, true).is_empty());
-        let plan = plan_lru_evictions(&[evicted], 260, 60, 240, 0, true);
+        assert!(plan_lru_evictions(&[evicted], 259, 60, 240, 1, true).is_empty());
+        let plan = plan_lru_evictions(&[evicted], 260, 60, 240, 1, true);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].1, LruDecision::HardDrop);
     }

@@ -35,7 +35,7 @@ macro_rules! once {
 /// them on drop, as before).
 fn keep_hash_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_KEEP_HASH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_KEEP_HASH").is_none_or(|v| v != "0"))
 }
 
 /// Whether staging upload buffers are dropped after upload when a texture
@@ -43,7 +43,7 @@ fn keep_hash_on() -> bool {
 /// `STAGING` until `let_go_idle`).
 fn drop_staging_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_DROP_STAGING").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_DROP_STAGING").is_none_or(|v| v != "0"))
 }
 
 /// Frame window within which a second+ content change keeps a texture's
@@ -450,7 +450,7 @@ fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
 /// `RefCell` buffers).
 fn read_pool_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_READ_POOL").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READ_POOL").is_none_or(|v| v != "0"))
 }
 
 const READ_POOL_MAX_ITEM: usize = 16 << 20;
@@ -801,10 +801,18 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
                 inner.last = Last::default();
             } else {
                 drop(inner);
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexSkipped, 1);
-                list.defer_texture_check(history);
-                return;
+                // Look now, while the list is recorded: a texture the title
+                // rewrote before this use is uploaded in this list, not one
+                // frame late. Writes between now and the submission are still
+                // caught by the check at submission (and uploaded at the next use).
+                history.check();
+                let clean = !history.inner.lock().unwrap_or_else(|e| e.into_inner()).dirty;
+                if clean {
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+                    list.defer_texture_check(history);
+                    return;
+                }
             }
         }
     }

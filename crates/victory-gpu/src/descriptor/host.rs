@@ -2665,7 +2665,7 @@ fn own_copy_on() -> bool {
 /// get a copy of their own bytes (`VICTORY_RAW_OWN_COPY=0` turns that off).
 fn raw_own_copy_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_OWN_COPY").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_OWN_COPY").is_none_or(|v| v != "0"))
 }
 
 fn own_bytes(
@@ -2739,9 +2739,8 @@ fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool, bool)> {
         let d = uav_desc(words);
         // SAFETY: a buffer view's union member.
         let b = unsafe { d.Anonymous.Buffer };
-        let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0
-            && d.Format == DXGI_FORMAT_R32_TYPELESS
-            && b.StructureByteStride == 0;
+        // Writable raw views stay on their buffer's copy (see `buffer_uav`).
+        let raw = false;
         let element = if b.StructureByteStride > 0 {
             u64::from(b.StructureByteStride)
         } else if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
@@ -2930,9 +2929,10 @@ fn buffer_uav(
             crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
         };
         let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
-        let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0
-            && desc.Format == DXGI_FORMAT_R32_TYPELESS
-            && b.StructureByteStride == 0;
+        // A writable view never gets a copy of its own for alignment alone:
+        // its writes would land where the other views of the same bytes (the
+        // next pass reading what this one wrote) do not look.
+        let raw = false;
         match own_bytes(shadow.offset(address), address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown, raw)
             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
         {

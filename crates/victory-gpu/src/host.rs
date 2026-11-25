@@ -1716,7 +1716,7 @@ static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 /// per use, as before).
 fn upload_pool_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_POOL").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_POOL").is_none_or(|v| v != "0"))
 }
 
 /// Maximum bytes kept idle in the shared upload buffer pool
@@ -1735,7 +1735,7 @@ fn upload_pool_max_bytes() -> u64 {
 /// allocates and frees a committed read-back buffer per use).
 fn readback_pool_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_READBACK_POOL").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READBACK_POOL").is_none_or(|v| v != "0"))
 }
 
 const READBACK_POOL_MAX_BYTES: u64 = 32 << 20;

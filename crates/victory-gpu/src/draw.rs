@@ -2012,7 +2012,7 @@ impl State {
         // `VICTORY_HEAP_BUFFER_STATE=0` disables intra-list UAV->SRV barriers
         // and intra-frame changed-slot refreshes for heap buffer views.
         let track_state = *STATE_ON
-            .get_or_init(|| std::env::var_os("VICTORY_HEAP_BUFFER_STATE").is_some_and(|v| v == "1"));
+            .get_or_init(|| std::env::var_os("VICTORY_HEAP_BUFFER_STATE").is_none_or(|v| v != "0"));
         let heap = self
             .heaps
             .iter()

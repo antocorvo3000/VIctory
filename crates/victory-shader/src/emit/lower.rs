@@ -1082,7 +1082,7 @@ fn host_pixel_wave() -> u32 {
 /// two 32-lane halves through LDS (`VICTORY_MS_EXCHANGE=0` turns that off).
 pub(super) fn ms_exchange_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MS_EXCHANGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MS_EXCHANGE").is_none_or(|v| v != "0"))
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
