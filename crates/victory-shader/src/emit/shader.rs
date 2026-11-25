@@ -38,6 +38,7 @@ pub(crate) mod flags {
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    pub const BARYCENTRICS: u64 = 1 << 22;
     pub const ATOMIC64_TYPED: u64 = 1 << 27;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
@@ -105,6 +106,8 @@ pub(crate) struct Shader {
     pub nonuniform_handles: u32,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
+    /// Compute sampling with implicit derivatives needs validator 1.8.
+    pub compute_derivatives: bool,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
@@ -164,6 +167,7 @@ impl Shader {
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
+            compute_derivatives: false,
             wave_size: None,
             lds_dwords: 0,
             lds: None,
@@ -777,7 +781,13 @@ impl Shader {
         let six = i32c(&mut self, 6);
         let version = self.m.md_node(vec![Some(one), Some(six)]);
         self.m.named_md("dx.version", vec![version]);
-        self.m.named_md("dx.valver", vec![version]);
+        let validator = if self.compute_derivatives {
+            let eight = i32c(&mut self, 8);
+            self.m.md_node(vec![Some(one), Some(eight)])
+        } else {
+            version
+        };
+        self.m.named_md("dx.valver", vec![validator]);
         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
@@ -817,6 +827,9 @@ impl Shader {
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
         }
+        if self.flags & flags::BARYCENTRICS != 0 {
+            features |= 0x2_0000;
+        }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;
         }
@@ -838,6 +851,7 @@ impl Shader {
             self.outputs.iter().any(|o| o.kind == 3)
         };
         let psv0 = container::psv(&Psv {
+            entry_name: self.compute_derivatives.then_some("main"),
             stage: kind as u8,
             flag: flag && self.threads.is_none(),
             inputs: &self.inputs,

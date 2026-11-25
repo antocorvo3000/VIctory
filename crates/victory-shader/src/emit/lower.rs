@@ -24,6 +24,18 @@ mod bvh;
 
 type Why = &'static str;
 
+fn interpolation_mode(kind: Barycentric) -> Result<u8, Why> {
+    Ok(match kind {
+        Barycentric::PerspectiveCenter => 2,
+        Barycentric::PerspectiveCentroid => 3,
+        Barycentric::PerspectiveSample => 6,
+        Barycentric::LinearCenter => 4,
+        Barycentric::LinearCentroid => 5,
+        Barycentric::LinearSample => 7,
+        Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -185,6 +197,7 @@ struct Lower<'a> {
     data_phis: Vec<(V, usize, usize)>,
     read_phis: HashSet<Value>,
     params: HashMap<Value, (usize, u32)>,
+    barycentrics: HashMap<Value, (Barycentric, u8)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     /// Handles of root SRVs and UAVs read as bounded views, by user-data
@@ -589,6 +602,7 @@ impl<'a> Lower<'a> {
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
+            barycentrics: HashMap::new(),
             user_data: None,
             user_reads: BTreeMap::new(),
             root_views: HashMap::new(),
@@ -1371,6 +1385,12 @@ impl<'a> Lower<'a> {
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
+                    Some(&Input::Barycentric { kind, index }) => {
+                        // Attribute interpolation only needs a signature input
+                        // when the shader directly reads the coordinates.
+                        self.barycentrics.insert(v, (kind, index));
+                        continue;
+                    }
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
                     // refuses reads of undef).
@@ -1536,6 +1556,47 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn barycentric_input(&mut self, kind: Barycentric, index: u8) -> Result<Val, Why> {
+        let mode = interpolation_mode(kind)?;
+        if index >= 2 {
+            return Err("a barycentric component");
+        }
+        let id = if let Some(id) = self
+            .s
+            .inputs
+            .iter()
+            .position(|e| e.kind == 28 && e.interp == mode)
+        {
+            id
+        } else {
+            let perspective = |mode| matches!(mode, 2 | 3 | 6);
+            let mut count = 0;
+            for e in self.s.inputs.iter().filter(|e| e.kind == 28) {
+                if perspective(e.interp) == perspective(mode) {
+                    return Err("two direct barycentric inputs of the same interpolation type");
+                }
+                count += 1;
+            }
+            let id = self.s.inputs.len();
+            self.s.inputs.push(SigElement {
+                name: "SV_Barycentrics".into(),
+                index: count,
+                kind: 28,
+                comp: 9,
+                interp: mode,
+                row: None,
+                col: 0,
+                cols: 3,
+                usage: 0,
+                half: false,
+            });
+            id
+        };
+        self.s.flags |= flags::BARYCENTRICS;
+        // Console I and J weight vertices 1 and 2, which are DXIL's y and z.
+        Ok(self.load_any_input(id, index + 1))
+    }
+
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
         if self.phi_at.contains_key(&v) {
@@ -1552,6 +1613,11 @@ impl<'a> Lower<'a> {
         }
         if let Some(&(param, dword)) = self.params.get(&v) {
             let val = self.user(param, dword);
+            self.vals.insert(v, val);
+            return Ok(val);
+        }
+        if let Some(&(kind, index)) = self.barycentrics.get(&v) {
+            let val = self.barycentric_input(kind, index)?;
             self.vals.insert(v, val);
             return Ok(val);
         }
@@ -7117,18 +7183,7 @@ impl<'a> Lower<'a> {
                 attribute,
                 barycentric,
                 ..
-            } => (
-                attribute,
-                match barycentric {
-                    Barycentric::PerspectiveCenter => 2,
-                    Barycentric::PerspectiveCentroid => 3,
-                    Barycentric::PerspectiveSample => 6,
-                    Barycentric::LinearCenter => 4,
-                    Barycentric::LinearCentroid => 5,
-                    Barycentric::LinearSample => 7,
-                    Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
-                },
-            ),
+            } => (attribute, interpolation_mode(*barycentric)?),
             // P0, the provoking vertex: a flat (nointerpolation) input.
             Interp::Vertex {
                 attribute,
@@ -7592,6 +7647,15 @@ impl<'a> Lower<'a> {
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
         };
+        if matches!(op, 60 | 61)
+            && let StageIo::Cs(cs) = self.x.native.io
+        {
+            let [x, y, z] = cs.threads;
+            let linear_quads = y == 1 && z == 1 && x.is_multiple_of(4);
+            let tiled_quads = x.is_multiple_of(2) && y.is_multiple_of(2);
+            // Keep the existing validator target for incompatible groups.
+            self.s.compute_derivatives = linear_quads || tiled_quads;
+        }
         if op == 72 {
             // Width, height, depth or layers, levels (per dmask) of the level
             // in the first address: DXIL's dimensions; a channel DXIL leaves
@@ -9486,7 +9550,15 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
                 let read = live.contains(&(phi.value, n));
-                let x = match (self.vals.get(&arg).copied(), bit) {
+                let mut value = self.vals.get(&arg).copied();
+                if read
+                    && value.is_none()
+                    && (self.params.contains_key(&arg) || self.barycentrics.contains_key(&arg))
+                {
+                    // A live phi can be the first read of an entry input.
+                    value = Some(self.get(arg).unwrap_or_else(Val::Missing));
+                }
+                let x = match (value, bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     // No lane from this edge reads it, or no lane comes
                     // along it at all: any value will do.
@@ -9598,6 +9670,16 @@ mod tests {
         used: Vec<UsedResource>,
         wave64: bool,
     ) -> Result<Lowered, crate::ShaderError> {
+        lower_compute(words, layout, used, wave64, [1, 1, 1])
+    }
+
+    fn lower_compute(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        wave64: bool,
+        threads: [u32; 3],
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
         let native = NativeProgram {
@@ -9609,7 +9691,7 @@ mod tests {
             io: StageIo::Cs(ComputeIo {
                 // The layout's user SGPRs (at least two), 512 bytes of LDS.
                 rsrc2: 1 << 15 | sgprs.max(2) << 1,
-                threads: [1, 1, 1],
+                threads,
             }),
             code,
         };
@@ -9628,6 +9710,42 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
+    }
+
+    #[test]
+    fn implicit_compute_sampling_validates_with_quad_threads() {
+        use super::super::validator::Validator;
+
+        let words = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xBE84_0301, // s_mov_b32 s4, s1
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0201,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[2:3], null
+            0xF408_0402,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[4:5], null
+            0xF080_0F08,
+            0x0082_0400, // image_sample v[4:7], v[0:1], s[8:15], s[16:19]
+            0xD834_0000,
+            0x0000_0400, // ds_write_b32 v0, v4
+            S_ENDPGM,
+        ];
+        for (threads, runtime_info_size) in [([4, 1, 1], 52), ([2, 2, 1], 52), ([1, 1, 1], 48)] {
+            let (layout, used) = texture_tables();
+            let mut shader = lower_compute(&words, layout, used, false, threads).unwrap();
+            let container = crate::Container::parse(&shader.dxil).unwrap();
+            let psv = container.part(crate::FourCC::PSV0).unwrap();
+            assert_eq!(
+                u32::from_le_bytes(psv.data[..4].try_into().unwrap()),
+                runtime_info_size
+            );
+            if runtime_info_size == 52
+                && let Ok(mut validator) = Validator::load(Validator::default_path().as_deref())
+            {
+                validator.validate(&mut shader.dxil).unwrap();
+            }
+        }
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.
