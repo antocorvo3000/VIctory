@@ -18,6 +18,24 @@ use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Bool, LaneExit, Meets, Structured};
 
+/// `VICTORY_TAKEN_EDGE_DESCRIPTOR=0`: trace every predecessor edge of a
+/// descriptor phi even when no lane can take that edge.
+pub(crate) fn taken_edge_descriptor_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_TAKEN_EDGE_DESCRIPTOR.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TAKEN_EDGE_DESCRIPTOR").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`taken_edge_descriptor_on`], for its thread only.
+    pub(crate) static TEST_TAKEN_EDGE_DESCRIPTOR: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// An instruction: block and index in [`crate::ir::Block::insts`].
 pub type Site = (usize, usize);
 
@@ -1316,7 +1334,8 @@ impl<'a> Tracer<'a> {
         }
         joins.push(block);
         let phis = &self.p.blocks[block].phis;
-        let edge = |j: usize| -> Vec<Term> {
+        let preds = &self.p.blocks[block].preds;
+        let edge_words = |j: usize| -> Vec<Term> {
             words
                 .iter()
                 .map(|w| match phi_of(w) {
@@ -1325,9 +1344,34 @@ impl<'a> Tracer<'a> {
                 })
                 .collect()
         };
-        let args = (0..self.p.blocks[block].preds.len())
-            .map(|j| self.classify(&edge(j), joins, known))
-            .collect::<Result<_, _>>();
+        let trace_edge = |j: usize, joins: &mut Vec<usize>, known: &mut Known| {
+            self.classify(&edge_words(j), joins, known)
+        };
+        let args = if taken_edge_descriptor_on() {
+            let taken: Vec<bool> = preds.iter().map(|&q| self.edge_taken(q, block)).collect();
+            match taken.iter().position(|&t| t) {
+                Some(first) if taken.contains(&false) => {
+                    trace_edge(first, joins, known).and_then(|live| {
+                        (0..preds.len())
+                            .map(|j| {
+                                if taken[j] {
+                                    trace_edge(j, joins, known)
+                                } else {
+                                    Ok(live.clone())
+                                }
+                            })
+                            .collect::<Result<_, _>>()
+                    })
+                }
+                _ => (0..preds.len())
+                    .map(|j| trace_edge(j, joins, known))
+                    .collect::<Result<_, _>>(),
+            }
+        } else {
+            (0..preds.len())
+                .map(|j| trace_edge(j, joins, known))
+                .collect::<Result<_, _>>()
+        };
         let source = match args {
             Ok(args) => Ok(Source::Phi { block, args }),
             // An edge holds no descriptor. With only one edge the lanes
@@ -1336,7 +1380,7 @@ impl<'a> Tracer<'a> {
             // has no lane left that reads it), if that can be named where
             // it is read.
             Err(e) => match self.only_edge(block, known) {
-                Some(j) => match self.classify(&edge(j), joins, known) {
+                Some(j) => match self.classify(&edge_words(j), joins, known) {
                     Ok(source) if self.anywhere(&source) => Ok(source),
                     _ => Err(e),
                 },
@@ -1345,6 +1389,24 @@ impl<'a> Tracer<'a> {
         };
         joins.pop();
         source.map(Some)
+    }
+
+    /// Whether some lane goes from block `q` to `b` (`Lower::never_taken`'s test).
+    fn edge_taken(&self, q: usize, b: usize) -> bool {
+        let Some(lanes) = self.lanes else {
+            return true;
+        };
+        let mut edge = vec![(lanes.reach[q], true)];
+        if let LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } = lanes.exits[q]
+            && taken != not_taken
+        {
+            edge.push((when, taken == b));
+        }
+        lanes.bools.meet(&edge)
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced

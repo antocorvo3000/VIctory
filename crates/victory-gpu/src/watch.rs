@@ -324,6 +324,53 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
+/// Checks non-destructively (without resetting `MEM_WRITE_WATCH` bits or
+/// modifying `Guards`) whether any CPU write may have touched `[start, end)`
+/// since `copied_ticks` (one entry per 64 KiB `PAGE` starting at `start / PAGE`).
+pub(crate) fn has_dirty_since(start: usize, end: usize, copied_ticks: &[u64]) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    if start >= end {
+        return false;
+    }
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    if copied_ticks.len() < last - first || copied_ticks[..last - first].contains(&0) {
+        return true;
+    }
+    {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let j = &mut *j;
+        for p in first..last {
+            if let Some(&w) = j.written.get(&p)
+                && w > copied_ticks[p - first]
+            {
+                return true;
+            }
+        }
+        let mut count = (last - first) * PAGE / KERNEL_PAGE;
+        j.found.resize(count.max(j.found.len()), 0);
+        let mut granularity = 0;
+        // SAFETY: `j.found` holds `count` entries; flags=0 peeks without resetting.
+        let ok = unsafe {
+            GetWriteWatch(
+                0,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } == 0;
+        if ok {
+            return count != 0;
+        }
+    }
+    if !is_view(first * PAGE, last * PAGE) {
+        return true;
+    }
+    let g = guards();
+    !(first..last).all(|b| g.protected.contains(&b) || g.absent.contains(&b))
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
@@ -673,6 +720,28 @@ fn protect_alias(g: &mut Guards, block: usize) {
     if g.protected.contains(&block) {
         return;
     }
+    if crate::copyback::block_has_guarded_pages(block) {
+        let first = block * (BLOCK / KERNEL_PAGE);
+        let mut any = false;
+        let mut all_covered = true;
+        for p in first..first + (BLOCK / KERNEL_PAGE) {
+            if crate::copyback::is_page_guarded(p) {
+                any = true;
+                continue;
+            }
+            let mut old = 0;
+            // SAFETY: title view memory; only its protection changes.
+            if unsafe { VirtualProtect((p * KERNEL_PAGE) as *const _, KERNEL_PAGE, PAGE_READONLY, &mut old) } != 0 {
+                any = true;
+            } else {
+                all_covered = false;
+            }
+        }
+        if any && all_covered {
+            g.protected.insert(block);
+        }
+        return;
+    }
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
@@ -684,6 +753,9 @@ fn protect_alias(g: &mut Guards, block: usize) {
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
+        if crate::copyback::has_active_guards() && (from..to).any(crate::copyback::block_has_guarded_pages) {
+            return false;
+        }
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
         unsafe {
@@ -704,6 +776,32 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         return;
     }
     for block in from..to {
+        if crate::copyback::block_has_guarded_pages(block) {
+            let first = block * (BLOCK / KERNEL_PAGE);
+            let mut all_ok = true;
+            for p in first..first + (BLOCK / KERNEL_PAGE) {
+                if crate::copyback::is_page_guarded(p) {
+                    continue;
+                }
+                let mut old = 0;
+                // SAFETY: title view memory; only its protection changes.
+                if unsafe {
+                    VirtualProtect(
+                        (p * KERNEL_PAGE) as *const _,
+                        KERNEL_PAGE,
+                        PAGE_READONLY,
+                        &mut old,
+                    )
+                } == 0
+                {
+                    all_ok = false;
+                }
+            }
+            if all_ok {
+                note(g, block, block + 1);
+            }
+            continue;
+        }
         if set(block, block + 1) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
@@ -763,6 +861,25 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        if crate::copyback::block_has_guarded_pages(block) {
+            let first = block * (BLOCK / KERNEL_PAGE);
+            for p in first..first + (BLOCK / KERNEL_PAGE) {
+                if crate::copyback::is_page_guarded(p) {
+                    continue;
+                }
+                let mut old = 0;
+                // SAFETY: a 4 KiB page of a block we made read-only.
+                unsafe {
+                    VirtualProtect(
+                        (p * KERNEL_PAGE) as *const _,
+                        KERNEL_PAGE,
+                        PAGE_READWRITE,
+                        &mut old,
+                    )
+                };
+            }
+            continue;
+        }
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -775,6 +892,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    crate::copyback::materialize_range(at, len, crate::copyback::AccessReason::KernelWrite);
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
@@ -1017,10 +1135,16 @@ pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync
 pub struct Remapping {
     _held: Held<std::sync::RwLockWriteGuard<'static, ()>>,
     since: std::time::Instant,
+    range: std::ops::Range<usize>,
+    previous: Vec<crate::inplace::PhysicalSpan>,
 }
 
 impl Drop for Remapping {
     fn drop(&mut self) {
+        if !self.range.is_empty() && crate::memory::ray_memory() {
+            let current = crate::inplace::physical_spans(&self.range);
+            crate::inplace::physical_changes(&self.previous, &current, crate::writeback::remapped);
+        }
         REMAPS[2].fetch_add(self.since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -1032,9 +1156,10 @@ impl Drop for Remapping {
 /// and the mapping again, over all the bytes whose mapping it changes.
 pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
     use std::sync::atomic::Ordering::Relaxed;
+    crate::copyback::materialize_range(at, len, crate::copyback::AccessReason::Remapping);
     let started = std::time::Instant::now();
+    let end = at.saturating_add(len);
     let held = if by_range() {
-        let end = at.saturating_add(len);
         let mut s = spans();
         s.next += 1;
         let id = s.next;
@@ -1051,11 +1176,19 @@ pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
     } else {
         Held::All(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
     };
+    let range = at..end;
+    let previous = if crate::memory::ray_memory() {
+        crate::inplace::physical_spans(&range)
+    } else {
+        Vec::new()
+    };
     REMAPS[0].fetch_add(1, Relaxed);
     REMAPS[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
     Remapping {
         _held: held,
         since: std::time::Instant::now(),
+        range,
+        previous,
     }
 }
 
@@ -1125,6 +1258,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
+pub(crate) fn install_veh() {
+    install();
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
@@ -1137,13 +1274,21 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;
-        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
-        {
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
             return EXCEPTION_CONTINUE_SEARCH;
         }
+        let is_write = r.ExceptionInformation[0] == WRITE;
         let at = r.ExceptionInformation[1];
+        if crate::copyback::on_page_fault(at, is_write) {
+            if is_write {
+                let mut g = guards();
+                open(&mut g, at, at + 1);
+            }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if !is_write {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).

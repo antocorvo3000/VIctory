@@ -36,6 +36,32 @@ use crate::dxbc::{Container, FourCC};
 /// Vertices emitted per rectangle: two triangles.
 const VERTICES: u32 = 6;
 
+/// `VICTORY_RECT_RIGHT_ANGLE=0`: rectangle completion falls back to exact
+/// axis-aligned coordinate equality instead of choosing the corner opposite the
+/// longest side.
+fn rect_right_angle_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECT_RIGHT_ANGLE").is_none_or(|v| v != "0"))
+}
+
+/// Which of a rectangle's three corners (x and y of each) holds the right
+/// angle: the one opposite the longest side, else (ties, NaN) `1`. The
+/// geometry shader of [`rect_list_gs`] makes the same choice on the GPU.
+pub fn right_angle(xy: [[f32; 2]; 3]) -> usize {
+    let side = |i: usize, j: usize| {
+        let (dx, dy) = (xy[i][0] - xy[j][0], xy[i][1] - xy[j][1]);
+        dx * dx + dy * dy
+    };
+    let (d12, d20, d01) = (side(1, 2), side(2, 0), side(0, 1));
+    if d12 > d20 && d12 > d01 {
+        0
+    } else if d01 > d12 && d01 > d20 {
+        2
+    } else {
+        1
+    }
+}
+
 /// The scalars a geometry shader may emit per invocation (vertices times
 /// output components).
 const MAX_SCALARS: u32 = 1024;
@@ -155,22 +181,45 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         let apart = not(&mut s, together);
         plain = both(&mut s, plain, apart);
     }
-    // corner[i]: vertex i is the corner between the other two (the first
-    // that shares x with one of them and y with the other).
-    let mut corner: Vec<V> = Vec::new();
-    for i in 0..3 {
-        let (a, c) = ((i + 1) % 3, (i + 2) % 3);
-        let (xa, yc) = (same(&mut s, x[i], x[a]), same(&mut s, y[i], y[c]));
-        let (xc, ya) = (same(&mut s, x[i], x[c]), same(&mut s, y[i], y[a]));
-        let (one, other) = (both(&mut s, xa, yc), both(&mut s, xc, ya));
-        let shares = either(&mut s, one, other);
-        let mut here = both(&mut s, shares, plain);
-        for &found in &corner {
-            let earlier = not(&mut s, found);
-            here = both(&mut s, here, earlier);
+    // corner[i]: vertex i is the right-angle corner between the other two.
+    let corner: Vec<V> = if rect_right_angle_on() {
+        let side = |s: &mut Shader, i: usize, j: usize| {
+            let dx = s.m.bin(b, Bin::Sub, x[i], x[j]);
+            let dy = s.m.bin(b, Bin::Sub, y[i], y[j]);
+            let xx = s.m.bin(b, Bin::Mul, dx, dx);
+            let yy = s.m.bin(b, Bin::Mul, dy, dy);
+            s.m.bin(b, Bin::Add, xx, yy)
+        };
+        let (d12, d20, d01) = (side(&mut s, 1, 2), side(&mut s, 2, 0), side(&mut s, 0, 1));
+        let longest = |s: &mut Shader, d: V, others: [V; 2]| {
+            let [p, q] = others.map(|o| s.m.cmp(b, pred::OGT, d, o));
+            both(s, p, q)
+        };
+        let (at0, at2) = (longest(&mut s, d12, [d20, d01]), longest(&mut s, d01, [d12, d20]));
+        let c0 = both(&mut s, at0, plain);
+        let c2 = both(&mut s, at2, plain);
+        let not0 = not(&mut s, at0);
+        let not2 = not(&mut s, at2);
+        let neither = both(&mut s, not0, not2);
+        let c1 = both(&mut s, neither, plain);
+        vec![c0, c1, c2]
+    } else {
+        let mut corner: Vec<V> = Vec::new();
+        for i in 0..3 {
+            let (a, c) = ((i + 1) % 3, (i + 2) % 3);
+            let (xa, yc) = (same(&mut s, x[i], x[a]), same(&mut s, y[i], y[c]));
+            let (xc, ya) = (same(&mut s, x[i], x[c]), same(&mut s, y[i], y[a]));
+            let (one, other) = (both(&mut s, xa, yc), both(&mut s, xc, ya));
+            let shares = either(&mut s, one, other);
+            let mut here = both(&mut s, shares, plain);
+            for &found in &corner {
+                let earlier = not(&mut s, found);
+                here = both(&mut s, here, earlier);
+            }
+            corner.push(here);
         }
-        corner.push(here);
-    }
+        corner
+    };
 
     // What the six emitted vertices carry: [element][column][vertex].
     let mut emitted: Vec<Vec<[V; 6]>> = Vec::new();
@@ -277,6 +326,25 @@ fn either(s: &mut Shader, a: V, b: V) -> V {
 fn not(s: &mut Shader, a: V) -> V {
     let (entry, on) = (s.entry, s.m.bool(true));
     s.m.bin(entry, Bin::Xor, a, on)
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::right_angle;
+
+    /// The right angle is found wherever it is; triangles that are no
+    /// rectangle's take the corner opposite their longest side, and ties and
+    /// NaN keep `v1`.
+    #[test]
+    fn right_angles_are_found_in_any_order() {
+        let (tl, bl, br, tr) = ([0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]);
+        assert_eq!(right_angle([tl, bl, br]), 1);
+        assert_eq!(right_angle([tl, bl, tr]), 0);
+        assert_eq!(right_angle([bl, tr, tl]), 2);
+        assert_eq!(right_angle([[0.0, 0.0], [3.0, 1.0], [1.0, 0.0]]), 2, "obtuse at v2");
+        assert_eq!(right_angle([tl, tl, tl]), 1, "a point");
+        assert_eq!(right_angle([tl, [f32::NAN, 0.0], br]), 1);
+    }
 }
 
 #[cfg(test)]
@@ -414,6 +482,8 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             root_indexed_views: Vec::new(),
         };
         (

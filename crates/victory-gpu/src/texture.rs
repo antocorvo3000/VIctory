@@ -79,6 +79,10 @@ struct HistoryInner {
     on_demand: bool,
     detiled: u32,
     judged: [u64; 2],
+    /// Its staging buffer is detiled on the card: a staging buffer made
+    /// anew takes all of the memory at its first refresh, so a change can
+    /// be told by the pages written alone.
+    on_card: bool,
 }
 
 /// Persistent per-texture hash and rewrite history kept across staging-buffer
@@ -165,6 +169,83 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// Detiled on the card (`crate::detile`): the staging buffer holds the
+    /// tiled memory as it is, then the pattern tables.
+    gpu: Option<OnCard>,
+}
+
+/// A texture detiled on the card: the device-local buffer the program
+/// writes the subresources into (laid out as `footprints`), what it runs,
+/// and whether the staging buffer holds all of the tiled memory (until
+/// then no refresh copies only the pages written).
+struct OnCard {
+    linear: ID3D12Resource,
+    /// Its bytes (`crate::detile::take_linear`).
+    cap: u64,
+    plan: crate::detile::Plan,
+    filled: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for OnCard {
+    fn drop(&mut self) {
+        // The staging state goes once every list that used it was reset.
+        crate::detile::give_linear(self.linear.clone(), self.cap);
+    }
+}
+
+/// Detiling on the card: staging buffers made for the CPU to detile all
+/// the same (a second plane, no program, a layout the program does not
+/// cover).
+static ON_CARD_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Detiling on the card: staging buffers made for it, refreshes that
+/// copied the whole memory, refreshes that copied only the pages written,
+/// and the bytes the latter copied.
+static ON_CARD: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// `[made, whole copies, page copies, page bytes, made for the CPU]`.
+pub(crate) fn on_card_counts() -> [u64; 5] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c = ON_CARD.each_ref().map(|c| c.load(Relaxed));
+    [c[0], c[1], c[2], c[3], ON_CARD_REFUSED.load(Relaxed)]
+}
+
+/// Detiling on the card: a refresh of memory the write watch tracks copies
+/// only the 64 KiB pages written since the last one, not all of it
+/// (`VICTORY_GPU_DETILE_PAGES=0`: all of it, as before).
+fn pages_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_DETILE_PAGES").is_none_or(|v| v != "0"))
+}
+
+/// Where a refresh of a texture detiled on the card copies the memory to:
+/// its staging buffer, and whether that holds all of it already.
+#[derive(Clone, Copy)]
+struct Direct<'a> {
+    data: *mut u8,
+    filled: &'a std::sync::atomic::AtomicBool,
+}
+
+/// Copies the pages of `[memory, memory + size)` that `written` says were
+/// written after asking `since` into the same place of `to`; the bytes.
+fn copy_pages(to: *mut u8, memory: *const u8, size: usize, written: &[(usize, u64)], since: u64) -> usize {
+    let start = memory as usize;
+    let end = start + size;
+    let mut copied = 0;
+    for &(page, w) in written {
+        if w <= since {
+            continue;
+        }
+        let lo = (page * crate::watch::PAGE).max(start);
+        let hi = ((page + 1) * crate::watch::PAGE).min(end);
+        if lo >= hi {
+            continue;
+        }
+        // The staging buffer holds `size` bytes of the texture's memory.
+        crate::host::copy_mapped(to.wrapping_add(lo - start), lo as *const u8, hi - lo, false);
+        copied += hi - lo;
+    }
+    copied
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -861,13 +942,16 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
-    // refresh below holds until the list is reset.
+    // refresh below holds until the list is reset. Detiled on the card:
+    // the card's buffer, which the list's prelude fills from the staging
+    // buffer at submission, after the refresh.
+    let source: &ID3D12Resource = staging.gpu.as_ref().map_or(&*staging.buffer, |g| &g.linear);
     for (i, footprint) in staging.footprints.iter().enumerate() {
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let (gpu, d) = unsafe { (source.GetGPUVirtualAddress(), texture.GetDesc()) };
             let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
             list.note_read(
                 || {
@@ -900,7 +984,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&*staging.buffer) },
+            pResource: unsafe { std::mem::transmute_copy(source) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: *footprint,
@@ -908,6 +992,18 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         };
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+    if let Some(g) = &staging.gpu {
+        // Back to the common state, where the next prelude finds it.
+        // SAFETY: an open list; the prelude left the buffer a copy source.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &g.linear,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_COMMON,
+            )])
+        };
+        list.defer_detile(staging.clone());
     }
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
@@ -1109,13 +1205,25 @@ fn judgement_for(memory: usize, size: usize) -> [u64; 2] {
 /// false, leaves `last.hash` (and `last.asked` on write-watch hits) untouched
 /// on change so the next `Staging::refresh` still detiles.
 /// Returns `(bytes_read, changed)`.
+///
+/// `direct`: a texture detiled on the card, whose staging buffer takes the
+/// memory as it is. On a change the memory is copied straight into it,
+/// and `on_change` is given the staging buffer's bytes; where the write
+/// watch or the guards say which pages were written since the last
+/// refresh and the buffer holds the rest already, only those pages are
+/// copied, and nothing is hashed. `on_card` (a check alone, of such a
+/// texture): pages the guards say were written are a change, unhashed.
+#[allow(clippy::too_many_arguments)]
 fn check_memory_changed(
     memory: *const u8,
     size: usize,
     last: &mut Last,
     commit_change: bool,
+    on_card: bool,
+    direct: Option<Direct<'_>>,
     on_change: impl FnOnce(&[u8]),
 ) -> (usize, bool) {
+    use std::sync::atomic::Ordering::Relaxed;
     let start = memory as usize;
     if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
         if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
@@ -1124,7 +1232,23 @@ fn check_memory_changed(
         if !commit_change {
             return (0, true);
         }
-        last.asked = now;
+        let since = std::mem::replace(&mut last.asked, now);
+        if let Some(d) = direct {
+            let copied = if pages_on() && since != 0 && d.filled.load(Relaxed) {
+                ON_CARD[2].fetch_add(1, Relaxed);
+                let copied = copy_pages(d.data, memory, size, &written, since);
+                ON_CARD[3].fetch_add(copied as u64, Relaxed);
+                copied
+            } else {
+                ON_CARD[1].fetch_add(1, Relaxed);
+                crate::host::copy_mapped(d.data, memory, size, false);
+                size
+            };
+            d.filled.store(true, Relaxed);
+            // SAFETY: the staging buffer holds `size` bytes of the memory.
+            on_change(unsafe { std::slice::from_raw_parts(d.data, size) });
+            return (copied, true);
+        }
         // Read through the copy, which stands unmapped pages: memory of
         // big pools is too slow to ask page by page.
         with_read(size, |read| {
@@ -1138,11 +1262,21 @@ fn check_memory_changed(
     static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let mut guard_saw_write = false;
     let mut guard_now: Option<u64> = None;
+    // The pages the guards say were written, and the asking before.
+    let mut guard_written: Option<(Vec<(usize, u64)>, u64)> = None;
     if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
         && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
     {
         const HASH_EVERY: u64 = 8;
         let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+        // Detiling on the card: written pages need no hash to say the
+        // texture changed (a whole upload costs about what the hash does).
+        if !unwritten && !commit_change && on_card && pages_on() {
+            return (0, true);
+        }
+        if !unwritten && last.asked != 0 {
+            guard_written = Some((written.clone(), last.asked));
+        }
         if commit_change {
             last.asked = now;
         } else {
@@ -1233,6 +1367,24 @@ fn check_memory_changed(
         }
         return (size, changed);
     }
+    // Detiling on the card, the guards saw writes and the staging buffer
+    // holds the rest: those pages, no hash. The hash taken every few
+    // frames then finds a change once more (it is not kept here).
+    if let Some(d) = direct
+        && commit_change
+        && guard_saw_write
+        && pages_on()
+        && d.filled.load(Relaxed)
+        && let Some((written, since)) = guard_written
+    {
+        ON_CARD[2].fetch_add(1, Relaxed);
+        let copied = copy_pages(d.data, memory, size, &written, since);
+        ON_CARD[3].fetch_add(copied as u64, Relaxed);
+        last.hash = None;
+        // SAFETY: the staging buffer holds `size` bytes of the memory.
+        on_change(unsafe { std::slice::from_raw_parts(d.data, size) });
+        return (copied, true);
+    }
     if through_copy() {
         return with_title(memory, size, |tiled| {
             let hash = blake3::hash(tiled);
@@ -1285,9 +1437,24 @@ impl History {
         if inner.dirty || !inner.uploaded_once || inner.memory == 0 || inner.size == 0 {
             return;
         }
-        let memory = inner.memory as *const u8;
-        let size = inner.size;
-        let (read, changed) = check_memory_changed(memory, size, &mut inner.last, false, |_| {});
+        let (mut memory, mut size) = (inner.memory, inner.size);
+        if crate::copyback::has_active_guards() {
+            drop(inner);
+            crate::copyback::materialize_range(
+                memory as usize,
+                size,
+                crate::copyback::AccessReason::Preparing,
+            );
+            inner = waited(0, || self.inner.lock().unwrap_or_else(|e| e.into_inner()));
+            if inner.dirty || !inner.uploaded_once || inner.memory == 0 || inner.size == 0 {
+                return;
+            }
+            memory = inner.memory;
+            size = inner.size;
+        }
+        let memory = memory as *const u8;
+        let on_card = inner.on_card;
+        let (read, changed) = check_memory_changed(memory, size, &mut inner.last, false, on_card, None, |_| {});
         if changed {
             inner.dirty = true;
             inner.rewrites = inner.rewrites.saturating_add(1);
@@ -1323,7 +1490,7 @@ pub(crate) fn unchanged_on_card(resource: This) -> bool {
                 return false;
             }
             let mut inner = s.history.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let (_, changed) = check_memory_changed(s.memory, s.tiled_size as usize, &mut inner.last, false, |_| {});
+            let (_, changed) = check_memory_changed(s.memory, s.tiled_size as usize, &mut inner.last, false, s.gpu.is_some(), None, |_| {});
             if changed {
                 inner.dirty = true;
                 inner.rewrites = inner.rewrites.saturating_add(1);
@@ -1346,7 +1513,8 @@ pub(crate) fn unchanged_on_card(resource: This) -> bool {
     }
     let memory = inner.memory as *const u8;
     let size = inner.size;
-    let (_, changed) = check_memory_changed(memory, size, &mut inner.last, false, |_| {});
+    let on_card = inner.on_card;
+    let (_, changed) = check_memory_changed(memory, size, &mut inner.last, false, on_card, None, |_| {});
     if changed {
         inner.dirty = true;
         inner.rewrites = inner.rewrites.saturating_add(1);
@@ -1444,12 +1612,33 @@ impl Staging {
 
     fn refresh_timed(&self) -> usize {
         let size = self.tiled_size as usize;
+        crate::copyback::materialize_range(
+            self.memory as usize,
+            size,
+            crate::copyback::AccessReason::Preparing,
+        );
         let mut inner_guard = waited(0, || self.history.inner.lock().unwrap_or_else(|e| e.into_inner()));
         let inner = &mut *inner_guard;
         let was_uploaded = inner.uploaded_once;
         let mut detiled_held = None;
-        let (read, changed) = check_memory_changed(self.memory, size, &mut inner.last, true, |tiled| {
-            detiled_held = Some(self.detile_with_judgement(tiled, &mut inner.judged));
+        // Detiled on the card: a staging buffer that does not hold the
+        // memory yet takes all of it now, whatever the memory's last state.
+        let direct = self.gpu.as_ref().map(|g| Direct {
+            data: self.data,
+            filled: &g.filled,
+        });
+        if let Some(g) = &self.gpu
+            && !g.filled.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            inner.last = Last::default();
+        }
+        let on_card = self.gpu.is_some();
+        let (read, changed) = check_memory_changed(self.memory, size, &mut inner.last, true, on_card, direct, |tiled| {
+            detiled_held = Some(if on_card {
+                self.take_tiled(tiled, &mut inner.judged)
+            } else {
+                self.detile_with_judgement(tiled, &mut inner.judged)
+            });
         });
         if let Some(held) = detiled_held {
             inner.detiled = held;
@@ -1462,14 +1651,12 @@ impl Staging {
         read
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer, storing
-    /// the on-demand judgement into `judged_out`.
-    fn detile_with_judgement(&self, tiled: &[u8], judged_out: &mut [u64; 2]) -> u32 {
-        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-        // Levels on demand: which levels are the title's is judged here,
-        // once, for what the staging buffer holds from now on. The step
-        // that gives levels their memory goes by this answer.
-        let held = if self.on_demand {
+    /// Levels on demand: which levels are the title's is judged here,
+    /// once, for what the staging buffer holds from now on (stored into
+    /// `judged_out`). The step that gives levels their memory goes by this
+    /// answer. All levels otherwise.
+    fn judge_held(&self, judged_out: &mut [u64; 2]) -> u32 {
+        if self.on_demand {
             use std::sync::atomic::Ordering::Relaxed;
             let judged = self.judgement();
             *judged_out = judged;
@@ -1478,7 +1665,50 @@ impl Staging {
             held
         } else {
             u32::MAX
+        }
+    }
+
+    /// Detiled on the card: `tiled` (the texture's memory, or the staging
+    /// buffer the refresh copied it into) into the staging buffer as it is;
+    /// the list's prelude detiles it ([`Staging::record_detile`]).
+    fn take_tiled(&self, tiled: &[u8], judged_out: &mut [u64; 2]) -> u32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.dirty.store(true, Relaxed);
+        let held = self.judge_held(judged_out);
+        if let Some(g) = &self.gpu {
+            let len = tiled.len().min(self.tiled_size as usize);
+            if tiled.as_ptr() != self.data.cast_const() {
+                ON_CARD[1].fetch_add(1, Relaxed);
+                // SAFETY: the staging buffer holds `tiled_size` bytes before
+                // its header.
+                unsafe { std::ptr::copy_nonoverlapping(tiled.as_ptr(), self.data, len) };
+            }
+            g.filled.store(true, Relaxed);
+        }
+        held
+    }
+
+    /// Records, in a list's prelude, the detiling of the staging buffer
+    /// into the buffer the list copies into the texture.
+    pub(crate) fn record_detile(&self, list: &ID3D12GraphicsCommandList) {
+        let (Some(g), Some(d)) = (&self.gpu, crate::detile::detiler()) else {
+            return;
         };
+        let held = if self.on_demand {
+            self.detiled.load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            u32::MAX
+        };
+        // SAFETY: a live buffer.
+        let tiled = unsafe { self.buffer.GetGPUVirtualAddress() };
+        crate::detile::record(d, list, tiled, &g.linear, &g.plan, held);
+    }
+
+    /// Detiles `tiled` (the texture's memory) into the staging buffer, storing
+    /// the on-demand judgement into `judged_out`.
+    fn detile_with_judgement(&self, tiled: &[u8], judged_out: &mut [u64; 2]) -> u32 {
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        let held = self.judge_held(judged_out);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -1926,10 +2156,46 @@ fn staging(resource: This, texture: &ID3D12Resource, host_id: u64) -> Option<Arc
         SKIPPED[4].fetch_add(1, Relaxed);
         return None;
     }
-    let Some((buffer, data, cap)) = host.take_upload(total) else {
+    // Detiled on the card where the program covers the layout: the
+    // staging buffer takes the tiled memory and the pattern tables, the
+    // card's buffer the subresources. Else on the CPU.
+    let on_card = (crate::detile::on() && stencil.is_none() && crate::detile::detiler().is_some())
+        .then(|| crate::detile::plan(&layout, &footprints, &rows, u32::from(d.MipLevels)))
+        .flatten()
+        .and_then(|plan| {
+            let (linear, cap) = crate::detile::take_linear(total)?;
+            crate::host::name(&linear, || {
+                format!("detiled {resource:?} {}x{}x{} f{}", d.Width, d.Height, d.DepthOrArraySize, d.Format.0)
+            });
+            Some(OnCard {
+                linear,
+                cap,
+                plan,
+                filled: std::sync::atomic::AtomicBool::new(false),
+            })
+        });
+    if crate::detile::on() && on_card.is_none() {
+        ON_CARD_REFUSED.fetch_add(1, Relaxed);
+        once!(?desc, "a texture detiled on the CPU: the card's program does not cover it");
+    }
+    let staged = on_card.as_ref().map_or(total, |g| g.plan.tiled_bytes());
+    let Some((buffer, data, cap)) = host.take_upload(staged) else {
         SKIPPED[4].fetch_add(1, Relaxed);
         return None;
     };
+    if let Some(g) = &on_card {
+        ON_CARD[0].fetch_add(1, Relaxed);
+        // SAFETY: the mapped staging buffer holds `tiled_bytes`, the header
+        // last.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                g.plan.header.as_ptr().cast::<u8>(),
+                data.add(g.plan.header_offset as usize),
+                crate::detile::HEADER_WORDS * 4,
+            );
+        }
+    }
+    let total = staged;
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1954,6 +2220,7 @@ fn staging(resource: This, texture: &ID3D12Resource, host_id: u64) -> Option<Arc
         inner.memory = memory as usize;
         inner.size = tiled_size as usize;
         inner.on_demand = on_demand;
+        inner.on_card = on_card.is_some();
         (inner.detiled, inner.uploaded_once && !inner.dirty)
     };
     let s = Arc::new(Staging {
@@ -1980,6 +2247,7 @@ fn staging(resource: This, texture: &ID3D12Resource, host_id: u64) -> Option<Arc
         detiled: std::sync::atomic::AtomicU32::new(detiled),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        gpu: on_card,
     });
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -2250,6 +2518,171 @@ mod title_memory_tests {
         super::unstage(res);
     }
 
+    /// Detiling on the card through the upload path: a staging buffer
+    /// made for it holds the tiled memory and the tables, the program
+    /// fills the card's buffer, and the host texture copied from it reads
+    /// back as the CPU detiles the memory; levels not held are zeros. Page
+    /// copies put just the pages written in place.
+    #[test]
+    fn staging_detiled_on_the_card_matches_the_cpu() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+        use windows::core::Interface;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        crate::detile::FORCE.set(true);
+        // BC1 (71), 200x120, 6 levels, SW_64KB_S_X; RGBA8 (28) 3-slice
+        // array, 5 levels, SW_4KB_D; R16 (56) SW_64KB_Z_X, 1 level.
+        let cases: [[u32; 14]; 3] = [
+            [3, 0, 0, 0, 200, 0, 120, 0x6_0001, 71, 1, 0, 0x100 | 25, 0, 0],
+            [3, 0, 0, 0, 90, 0, 70, 0x5_0003, 28, 1, 0, 0x100 | 6, 0, 0],
+            [3, 0, 0, 0, 333, 0, 99, 0x1_0001, 56, 1, 0, 0x100 | 24, 0, 0],
+        ];
+        for (k, words) in cases.iter().enumerate() {
+            // SAFETY: 56 bytes in ResourceDesc layout.
+            let rdesc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(*words) };
+            let tl = crate::resource::texture_layout(&rdesc).unwrap();
+            let layout = tl.planes[0].layout.clone();
+            let mut s = 0x1234_5678_u32 + k as u32;
+            let tiled: Vec<u8> = (0..layout.size as usize)
+                .map(|_| {
+                    s = s.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    (s >> 16) as u8
+                })
+                .collect();
+            let res = crate::resource::texture_at(tiled.as_ptr() as u64, words).unwrap();
+            let host_tex = crate::resource::host_resource(res).unwrap().clone();
+            let host_id = crate::resource::host_id(res).unwrap_or(0);
+            let staging = super::staging(res, &host_tex, host_id).unwrap();
+            let g = staging.gpu.as_ref().expect("detiled on the card");
+            let mut judged = [0, 0];
+            staging.take_tiled(&tiled, &mut judged);
+            // Page copies: the second page changes, and lands alone.
+            let (data, size) = (staging.data, layout.size as usize);
+            let mut changed = tiled.clone();
+            let page = crate::watch::PAGE;
+            let first_page = changed.as_ptr() as usize / page;
+            let from = ((first_page + 1) * page - changed.as_ptr() as usize).min(size);
+            let to = (from + page).min(size);
+            for b in &mut changed[from..to] {
+                *b ^= 0x5a;
+            }
+            let written = [(first_page, 1), (first_page + 1, 9)];
+            let copied = super::copy_pages(data, changed.as_ptr(), size, &written, 5);
+            assert_eq!(copied, to - from);
+            // SAFETY: the staging buffer holds `size` bytes.
+            let held_bytes = unsafe { std::slice::from_raw_parts(data, size) };
+            assert!(held_bytes == &changed[..], "case {k}: page copy");
+            let tiled = changed;
+            let held = if k == 1 { 0b1_0101 } else { u32::MAX };
+            let count = staging.footprints.len();
+            let total: u64 = staging
+                .footprints
+                .iter()
+                .zip(&staging.rows)
+                .map(|(f, &r)| f.Offset + u64::from(f.Footprint.RowPitch) * u64::from(r) * u64::from(f.Footprint.Depth))
+                .max()
+                .unwrap();
+            // SAFETY: plain D3D12 objects on the host device, used and
+            // waited for here; live buffers in the states named.
+            unsafe {
+                let d = host_tex.GetDesc();
+                let device = &host.device;
+                let queue: ID3D12CommandQueue = device
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList =
+                    device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let back = host.read_back_buffer(total).unwrap();
+                let mut texture: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Flags: D3D12_RESOURCE_FLAG_NONE,
+                            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            ..d
+                        },
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut texture,
+                    )
+                    .unwrap();
+                let texture = texture.unwrap();
+                let tiled_gpu = staging.buffer.GetGPUVirtualAddress();
+                crate::detile::record(crate::detile::detiler().unwrap(), &list, tiled_gpu, &g.linear, &g.plan, held);
+                let loc = |r: &ID3D12Resource, i: usize, placed: bool| D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(r),
+                    Type: if placed {
+                        D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT
+                    } else {
+                        D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX
+                    },
+                    Anonymous: if placed {
+                        D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: staging.footprints[i],
+                        }
+                    } else {
+                        D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 }
+                    },
+                };
+                for i in 0..count {
+                    list.CopyTextureRegion(&loc(&texture, i, false), 0, 0, 0, &loc(&g.linear, i, true), None);
+                }
+                list.ResourceBarrier(&[
+                    crate::host::transition(&g.linear, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+                    crate::host::transition(&texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                ]);
+                for i in 0..count {
+                    list.CopyTextureRegion(&loc(&back, i, true), 0, 0, 0, &loc(&texture, i, false), None);
+                }
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                queue.Signal(&fence, 1).unwrap();
+                let event = CreateEventW(None, false, false, None).unwrap();
+                fence.SetEventOnCompletion(1, event).unwrap();
+                WaitForSingleObject(event, INFINITE);
+                let mut p = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut p)).unwrap();
+                let got = std::slice::from_raw_parts(p.cast::<u8>(), total as usize);
+                let n = layout.desc.element_bytes as usize;
+                for (i, fp) in staging.footprints.iter().enumerate() {
+                    let (mip, slice) = (i as u32 % staging.mips, i as u32 / staging.mips);
+                    let m = layout.mips[mip as usize];
+                    let pitch = fp.Footprint.RowPitch as usize;
+                    let len = pitch * staging.rows[i] as usize;
+                    let at = fp.Offset as usize;
+                    let mut want = vec![0u8; len];
+                    if held & (1 << mip) != 0 {
+                        layout.detile(&tiled, mip, slice, &mut want, pitch, len).unwrap();
+                    }
+                    for y in 0..m.height as usize {
+                        let r = y * pitch;
+                        let w = m.width as usize * n;
+                        assert_eq!(got[at + r..at + r + w], want[r..r + w], "case {k} mip {mip} slice {slice} row {y}");
+                    }
+                }
+                back.Unmap(0, None);
+            }
+            drop(staging);
+            super::unstage(res);
+            eprintln!("case {k}: {count} subresources detiled on the card as on the CPU");
+        }
+        crate::detile::FORCE.set(false);
+    }
+
     fn partial_throttle_bypasses_wait_when_guard_sees_write() {
         assert!(!super::should_skip_partial(None, 100, false, true));
         // Unwritten partial texture waits 30 frames even with immediate enabled.
@@ -2310,7 +2743,7 @@ mod title_memory_tests {
 
         // Initial commit pass detiles and records the blake3 hash.
         let mut detiled = 0usize;
-        let (_, changed) = check_memory_changed(backing.as_ptr(), backing.len(), &mut last, true, |_| {
+        let (_, changed) = check_memory_changed(backing.as_ptr(), backing.len(), &mut last, true, false, None, |_| {
             detiled += 1;
         });
         assert!(changed);
@@ -2320,7 +2753,7 @@ mod title_memory_tests {
         // After staging is dropped, checking with commit_change=false against
         // unchanged memory finds no change and keeps the hash.
         let saved_hash = last.hash;
-        let (_, changed) = check_memory_changed(backing.as_ptr(), backing.len(), &mut last, false, |_| {
+        let (_, changed) = check_memory_changed(backing.as_ptr(), backing.len(), &mut last, false, false, None, |_| {
             unreachable!("unchanged memory must not detile");
         });
         assert!(!changed);
@@ -2329,11 +2762,11 @@ mod title_memory_tests {
         // Mutate memory: non-committing check detects the change while leaving
         // the old hash intact so the subsequent Staging refresh still detiles.
         backing[123] ^= 0xff;
-        let (_, changed) = check_memory_changed(backing.as_ptr(), backing.len(), &mut last, false, |_| {});
+        let (_, changed) = check_memory_changed(backing.as_ptr(), backing.len(), &mut last, false, false, None, |_| {});
         assert!(changed);
         assert_eq!(last.hash, saved_hash);
 
-        let (_, changed) = check_memory_changed(backing.as_ptr(), backing.len(), &mut last, true, |_| {
+        let (_, changed) = check_memory_changed(backing.as_ptr(), backing.len(), &mut last, true, false, None, |_| {
             detiled += 1;
         });
         assert!(changed);

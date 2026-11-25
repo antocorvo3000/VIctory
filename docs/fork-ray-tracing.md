@@ -1,8 +1,6 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25: **nothing is lit by ray tracing yet.** Most of the
-machinery translates and is unit-tested; it has not yet run end to end in the
-game. Everything here is off by default.
+Status, 2026-11-25: **opt-in behind runtime switches (default off).** The BVH structure builders, address-space directory, descriptor address tables, `DispatchX` thread sizing, and ray intersection/traversal lowering are implemented behind `VICTORY_RAYS=1` (and granular per-subsystem switches) with unit tests on synthetic BVHs and synthetic heaps/lists. End-to-end world lighting still needs in-game validation under those switches.
 
 ## What the title does
 
@@ -54,25 +52,17 @@ shaders and emulates the one instruction.
    the irradiance-cache shading program). This needed lane masks treated as
    plain numbers on some paths, and exact forms for programs written for
    64-lane waves running on a GPU with 32-lane waves.
-5. **A safety rule on the host side.** The builder's stages run only while
-   every builder pipeline the title has created has a host pipeline; otherwise
-   none run (`VICTORY_BVH_BUILDER=1` asks for it; `VICTORY_BVH_QUARANTINE=1`
-   also keeps the builder's stores out of title memory, for a first test). A
-   partly working builder wrote garbage bounds into title memory and crashed
-   the title.
+5. **Host safety, lifetimes, and switches.**
+   - `VICTORY_RAYS=1` enables the full ray-tracing stack by default across four switches: `VICTORY_RAY_SHADERS`, `VICTORY_RAY_MEMORY`, `VICTORY_RAY_DISPATCH`, and `VICTORY_BVH_BUILDER` (each inherits `VICTORY_RAYS`, default `0`, and can be toggled individually with `0`/`1`).
+   - When ray tracing is enabled and the builder has not tripped off, `ambient` (`CS_ScreenProbes_TemporalResolve` stand-in and `CS_UpdateHistory` reflection clamp) steps aside automatically (`VICTORY_AMBIENT=off` behavior unless `VICTORY_AMBIENT` is explicitly overridden) so the title's resolve output is used.
+   - The builder's stages run only while every created builder pipeline has a host pipeline (`VICTORY_BVH_BUILDER=1` / `VICTORY_RAYS=1`; `VICTORY_BVH_QUARANTINE=1` keeps builder stores out of title memory).
+   - Precise shader write tracking (`written_root_uavs`, `writes_guest_memory`), writeback ownership intervals across virtual memory remappings/reassignments, retired resource grace lifetimes, owner-aware descriptor/root-slot rebinding, growing dynamic raw-page view runs, and `DispatchX` thread-to-group conversion with tail-lane masking keep builder and traversal passes isolated from unrelated buffers.
 
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
-  of its pipelines are refused by the host (they still ask for 64-lane waves on
-  a 32-lane GPU) or do not translate.
-- Five shadow-mask trace programs do not translate yet.
-- An access to a title page that has no host copy is lost (a read gives zero, a
-  store is dropped).
-- Not publicly documented, and assumed: the instruction's rounding, the order
-  of two boxes entered at the same distance, and the result for a ray exactly
-  through an edge.
-- Cost on the GPU is unmeasured.
+- `VICTORY_FIRSTLANE_OWN=1` and `VICTORY_SKIP_PIPELINES=""` (the default skip list suppresses `39f0e9aeb156a61c`) can affect specific compute passes; in diagnostics builds, `VICTORY_BVH_TRACE=<hash[,hash...]>` logs builder root arguments.
+- An access to a title page that has no host copy is lost (a read gives zero, a store is dropped), though ray queries/stores also surface guest faults and dynamic descriptor address tables (`SLOT_VIEW_ADDRESSES`).
+- Cost and visual convergence across all hours/interiors on target AMD hardware remain to be measured in game.
 
 ## Where to look
 

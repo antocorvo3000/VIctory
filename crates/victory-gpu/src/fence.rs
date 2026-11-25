@@ -82,6 +82,10 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
+        if crate::copyback::defer_at_fence() {
+            drop(waiters);
+            crate::copyback::flush_all(crate::copyback::AccessReason::FenceWait);
+        }
         if !event.is_null() {
             set_event(event as usize);
         }
@@ -96,6 +100,9 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
             drop(waiters);
             crate::host::settle_for_fence();
             if fence.value.load(Ordering::Acquire) >= value {
+                if crate::copyback::defer_at_fence() {
+                    crate::copyback::flush_all(crate::copyback::AccessReason::FenceWait);
+                }
                 return S_OK;
             }
             tracing::warn!(value, "blocking fence wait not implemented");
@@ -112,6 +119,17 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
+    if crate::copyback::defer_at_fence() {
+        let has_waiter = fence
+            .waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(wanted, _)| wanted <= value);
+        if has_waiter {
+            crate::copyback::flush_all(crate::copyback::AccessReason::FenceWait);
+        }
+    }
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
     waiters.retain(|&(wanted, event)| {

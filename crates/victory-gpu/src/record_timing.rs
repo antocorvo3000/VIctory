@@ -26,7 +26,7 @@ pub(crate) fn enabled_from(value: Option<&str>) -> bool {
 pub(crate) fn record_parallel() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        record_parallel_from(std::env::var("VICTORY_RECORD_PARALLEL").ok().as_deref())
+        record_parallel_from(std::env::var("VICTORY_RECORD_PARALLEL").ok().as_deref().or(Some("1")))
     })
 }
 
@@ -61,9 +61,12 @@ pub(crate) enum Stage {
     SubmitSnapshots = 21,
     SubmitCardBefore = 22,
     SubmitPrelude = 23,
+    RootHeapBuffers = 24,
+    RootTable = 25,
+    RootFind = 26,
 }
 
-const STAGE_COUNT: usize = 24;
+const STAGE_COUNT: usize = 27;
 
 static CALLS: [AtomicU64; STAGE_COUNT] = [const { AtomicU64::new(0) }; STAGE_COUNT];
 static NS: [AtomicU64; STAGE_COUNT] = [const { AtomicU64::new(0) }; STAGE_COUNT];
@@ -146,6 +149,7 @@ pub(crate) fn record_thread_call(started: Option<Instant>) {
 /// Acquires `mutex`, recording wait time in [`Stage::LockWait`] when `VICTORY_RECORD_TIMING=1`
 /// and the lock is contended.
 #[inline]
+#[track_caller]
 pub(crate) fn lock_timed<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     if !enabled() {
         return mutex.lock().unwrap_or_else(|e| e.into_inner());
@@ -155,13 +159,16 @@ pub(crate) fn lock_timed<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
     let started = Instant::now();
     let guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
-    add(Stage::LockWait, started.elapsed().as_nanos() as u64);
+    let ns = started.elapsed().as_nanos() as u64;
+    add(Stage::LockWait, ns);
+    note_site(std::panic::Location::caller(), ns);
     guard
 }
 
 /// Acquires a read guard on `rwlock`, recording wait time in [`Stage::LockWait`] when
 /// `VICTORY_RECORD_TIMING=1` and the lock is contended.
 #[inline]
+#[track_caller]
 pub(crate) fn read_timed<T>(rwlock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     if !enabled() {
         return rwlock.read().unwrap_or_else(|e| e.into_inner());
@@ -171,13 +178,16 @@ pub(crate) fn read_timed<T>(rwlock: &std::sync::RwLock<T>) -> std::sync::RwLockR
     }
     let started = Instant::now();
     let guard = rwlock.read().unwrap_or_else(|e| e.into_inner());
-    add(Stage::LockWait, started.elapsed().as_nanos() as u64);
+    let ns = started.elapsed().as_nanos() as u64;
+    add(Stage::LockWait, ns);
+    note_site(std::panic::Location::caller(), ns);
     guard
 }
 
 /// Acquires a write guard on `rwlock`, recording wait time in [`Stage::LockWait`] when
 /// `VICTORY_RECORD_TIMING=1` and the lock is contended.
 #[inline]
+#[track_caller]
 pub(crate) fn write_timed<T>(rwlock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
     if !enabled() {
         return rwlock.write().unwrap_or_else(|e| e.into_inner());
@@ -187,8 +197,33 @@ pub(crate) fn write_timed<T>(rwlock: &std::sync::RwLock<T>) -> std::sync::RwLock
     }
     let started = Instant::now();
     let guard = rwlock.write().unwrap_or_else(|e| e.into_inner());
-    add(Stage::LockWait, started.elapsed().as_nanos() as u64);
+    let ns = started.elapsed().as_nanos() as u64;
+    add(Stage::LockWait, ns);
+    note_site(std::panic::Location::caller(), ns);
     guard
+}
+
+/// Contended lock waits by where the lock was taken: (file, line) to
+/// (waits, ns), since the last report.
+static SITES: Mutex<Option<std::collections::HashMap<(&'static str, u32), (u64, u64)>>> = Mutex::new(None);
+
+fn note_site(at: &'static std::panic::Location<'static>, ns: u64) {
+    let mut sites = SITES.lock().unwrap_or_else(|e| e.into_inner());
+    let e = sites.get_or_insert_with(Default::default).entry((at.file(), at.line())).or_default();
+    e.0 += 1;
+    e.1 += ns;
+}
+
+/// The six places whose locks were waited for longest since the last call.
+fn take_sites() -> String {
+    let taken = SITES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let mut all: Vec<_> = taken.into_iter().collect();
+    all.sort_by_key(|(_, (_, ns))| std::cmp::Reverse(*ns));
+    all.iter()
+        .take(6)
+        .map(|((file, line), (n, ns))| format!("{}:{line} {n} waits {:.1} ms", file.rsplit(['/', std::path::MAIN_SEPARATOR]).next().unwrap_or(file), *ns as f64 / 1e6))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn take_stage(stage: Stage) -> (u64, u64) {
@@ -276,6 +311,19 @@ pub(crate) fn log(frames: f64) {
         ms(ind_ns),
     );
 
+    let (hb_cnt, hb_ns) = take_stage(Stage::RootHeapBuffers);
+    let (rt_cnt, rt_ns) = take_stage(Stage::RootTable);
+    let (rf_cnt, rf_ns) = take_stage(Stage::RootFind);
+    tracing::info!(
+        "root views CPU/frame: heap buffers {:.0}: {:.2} ms, root SRV tables {:.0}: {:.2} ms, root views found {:.0}: {:.2} ms; locks waited longest: {}",
+        cnt(hb_cnt),
+        ms(hb_ns),
+        cnt(rt_cnt),
+        ms(rt_ns),
+        cnt(rf_cnt),
+        ms(rf_ns),
+        take_sites()
+    );
     let (_, ask_ns) = take_stage(Stage::SubmitAskOnce);
     let (_, copy_ns) = take_stage(Stage::SubmitCopyFill);
     let (_, ref_ns) = take_stage(Stage::SubmitRefresh);

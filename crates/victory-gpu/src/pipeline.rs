@@ -144,6 +144,7 @@ impl Shader {
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
+    pub(crate) compute_threads: Option<[u32; 3]>,
     pub(crate) used: Vec<victory_shader::UsedResource>,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
@@ -206,6 +207,10 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let compute_threads = programs.iter().find_map(|p| match &p.io {
+        victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
+        _ => None,
+    });
     let used = programs
         .into_iter()
         .find(|p| {
@@ -216,7 +221,12 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated {
+        host,
+        compute_threads,
+        used,
+        stores,
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -301,12 +311,30 @@ pub(crate) fn builder_off(why: &'static str) {
     }
 }
 
+#[cfg(windows)]
+fn builder_allowed_from(builder: Option<&std::ffi::OsStr>, rays: Option<&std::ffi::OsStr>) -> bool {
+    match builder {
+        Some(v) => v == "1",
+        None => rays.is_some_and(|v| v == "1"),
+    }
+}
+
+#[cfg(windows)]
+fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        builder_allowed_from(
+            std::env::var_os("VICTORY_BVH_BUILDER").as_deref(),
+            std::env::var_os("VICTORY_RAYS").as_deref(),
+        )
+    })
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -332,6 +360,17 @@ pub(crate) fn builder_runs() -> bool {
     );
     b.whole = true;
     true
+}
+
+/// Whether ray-tracing shaders, guest memory directory, dispatch handling, and
+/// builder execution are active (and the builder has not tripped off).
+#[cfg(windows)]
+pub(crate) fn rays_running() -> bool {
+    builder_allowed()
+        && crate::memory::ray_memory()
+        && victory_shader::emit::ray_shaders()
+        && crate::draw::State::ray_dispatch()
+        && !BUILDER.lock().unwrap_or_else(|e| e.into_inner()).off
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
@@ -433,7 +472,7 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(windows)]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+fn parse_shader_hashes(value: &str, setting: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -442,10 +481,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
             if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 Some(hash.to_ascii_lowercase())
             } else {
-                tracing::warn!(
-                    hash,
-                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
-                );
+                tracing::warn!(hash, setting, "expected a 16-digit shader hash");
                 None
             }
         })
@@ -460,7 +496,7 @@ fn skipped_shader(shaders: &[Arc<Shader>]) -> Option<&str> {
         // (driver memory grows ~240 MB/s while it runs); set VICTORY_SKIP_PIPELINES to override.
         let value = std::env::var("VICTORY_SKIP_PIPELINES")
             .unwrap_or_else(|_| "39f0e9aeb156a61c".to_owned());
-        parse_skip_hashes(&value)
+        parse_shader_hashes(&value, "VICTORY_SKIP_PIPELINES")
     });
     if hashes.is_empty() {
         return None;
@@ -469,6 +505,31 @@ fn skipped_shader(shaders: &[Arc<Shader>]) -> Option<&str> {
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
         .map(|shader| shader.hash.as_str())
+}
+
+/// Recording-time trace, independent of the present and heavy-frame capture.
+/// The budget is per shader so that a frequent stage cannot silence a later stage.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn trace_builder_args(this: This, log: impl FnOnce(&str, usize)) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SELECTED: OnceLock<HashMap<String, AtomicUsize>> = OnceLock::new();
+    let selected = SELECTED.get_or_init(|| {
+        let value = std::env::var("VICTORY_BVH_TRACE").unwrap_or_default();
+        parse_shader_hashes(&value, "VICTORY_BVH_TRACE")
+            .into_iter()
+            .map(|hash| (hash, AtomicUsize::new(0)))
+            .collect()
+    });
+    if selected.is_empty() {
+        return;
+    }
+    let hash = &pipeline(this).shaders[0].hash;
+    if let Some(n) = selected.get(hash)
+        && let Ok(previous) =
+            n.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < 256).then_some(n + 1))
+    {
+        log(hash, previous + 1);
+    }
 }
 
 #[cfg(windows)]
@@ -884,11 +945,24 @@ mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
-        assert!(super::parse_skip_hashes(" , ").is_empty());
+        assert!(super::parse_shader_hashes(" , ", "test").is_empty());
         assert_eq!(
-            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
+            super::parse_shader_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,", "test"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn builder_switch_defaults_off_and_inherits_victory_rays() {
+        use std::ffi::OsStr;
+        assert!(!super::builder_allowed_from(None, None));
+        assert!(super::builder_allowed_from(None, Some(OsStr::new("1"))));
+        assert!(!super::builder_allowed_from(
+            Some(OsStr::new("0")),
+            Some(OsStr::new("1"))
+        ));
+        assert!(super::builder_allowed_from(Some(OsStr::new("1")), None));
     }
 
     use super::*;

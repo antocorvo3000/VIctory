@@ -12,7 +12,9 @@
 //! colors. Raised, not added: the result is the next frame's history.
 //!
 //! `VICTORY_AMBIENT=<level>` sets it (0.6 by default, 0 for none); `off`
-//! keeps the title's own output.
+//! keeps the title's own output. When unset and ray tracing is active, the
+//! stand-in steps aside automatically (`VICTORY_AMBIENT=off` behavior) so the
+//! title's resolve output is used.
 //! shortcut: the same light everywhere, from everywhere; gone once rays run.
 
 use std::sync::OnceLock;
@@ -36,17 +38,48 @@ pub(crate) const LIGHT: (u8, u32) = (1, 176);
 /// title's resolve wrote; 0 is no indirect diffuse light at all.
 const DEFAULT: f32 = 0.6;
 
-/// The floor; `None` if off.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Setting {
+    Auto,
+    Explicit(Option<f32>),
+}
+
+fn parse_setting(value: Option<&str>) -> Setting {
+    let Some(raw) = value else {
+        return Setting::Auto;
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Setting::Auto;
+    }
+    if trimmed.eq_ignore_ascii_case("off") {
+        return Setting::Explicit(None);
+    }
+    match trimmed
+        .parse::<f32>()
+        .ok()
+        .filter(|l| l.is_finite() && *l >= 0.0)
+    {
+        Some(level) => Setting::Explicit(Some(level)),
+        None => Setting::Auto,
+    }
+}
+
+fn level_for(setting: Setting, rays: bool) -> Option<f32> {
+    match setting {
+        Setting::Explicit(level) => level,
+        Setting::Auto => (!rays).then_some(DEFAULT),
+    }
+}
+
+/// The floor; `None` if off or stepped aside for active ray tracing.
 pub(crate) fn level() -> Option<f32> {
-    static LEVEL: OnceLock<f32> = OnceLock::new();
-    let level = *LEVEL.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT").unwrap_or_default();
-        if set.trim() == "off" {
-            return -1.0;
-        }
-        set.trim().parse().ok().filter(|l: &f32| l.is_finite() && *l >= 0.0).unwrap_or(DEFAULT)
+    static SETTING: OnceLock<Setting> = OnceLock::new();
+    let setting = *SETTING.get_or_init(|| {
+        let value = std::env::var("VICTORY_AMBIENT").ok();
+        parse_setting(value.as_deref())
     });
-    (level >= 0.0).then_some(level)
+    level_for(setting, crate::pipeline::rays_running())
 }
 
 /// The light's colour: warm white, or what `VICTORY_AMBIENT_TINT=r,g,b`
@@ -559,5 +592,20 @@ mod tests {
             return;
         };
         super::make(&host.device).expect("the ambient pass");
+    }
+
+    #[test]
+    fn ambient_steps_aside_when_rays_run_unless_explicitly_set() {
+        use super::{DEFAULT, Setting, level_for, parse_setting};
+
+        assert_eq!(parse_setting(None), Setting::Auto);
+        assert_eq!(parse_setting(Some("  ")), Setting::Auto);
+        assert_eq!(parse_setting(Some("off")), Setting::Explicit(None));
+        assert_eq!(parse_setting(Some("0.25")), Setting::Explicit(Some(0.25)));
+
+        assert_eq!(level_for(Setting::Auto, false), Some(DEFAULT));
+        assert_eq!(level_for(Setting::Auto, true), None);
+        assert_eq!(level_for(Setting::Explicit(None), false), None);
+        assert_eq!(level_for(Setting::Explicit(Some(0.25)), true), Some(0.25));
     }
 }

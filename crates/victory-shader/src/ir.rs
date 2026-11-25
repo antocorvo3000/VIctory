@@ -246,6 +246,23 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
 /// address) moves as a pair (`s_mov_b64`) when every save and every restore
 /// of the two lanes come together, so a parked lane mask comes back as the
 /// mask it is; otherwise its halves come back as two scalars.
+/// `VICTORY_UNSPILL_MIXED_PAIRS=0`: a parked lane pair that shares one of its
+/// VGPR lanes with an unrelated 32-bit spill elsewhere is left unpaired as before.
+fn unspill_mixed_pairs_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_UNSPILL_MIXED_PAIRS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNSPILL_MIXED_PAIRS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`unspill_mixed_pairs_on`], for its thread only.
+    pub(crate) static TEST_UNSPILL_MIXED_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 fn unspill(
     list: &mut [gfx10::Instruction],
     leaders: &[usize],
@@ -385,7 +402,10 @@ fn unspill(
             None
         }
     };
+    let mixed = unspill_mixed_pairs_on();
     let mut pairs: Vec<(u8, u32)> = Vec::new();
+    let mut paired: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut paired_uppers: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for &(reg, lane) in &slots {
         if !wave64 || pairs.iter().any(|&(r, l)| r == reg && l + 1 == lane) || !slots.contains(&(reg, lane + 1)) {
             continue;
@@ -398,6 +418,33 @@ fn unspill(
         distinct.dedup();
         if partners.iter().all(Option::is_some) && distinct.len() == lower.len() && upper == lower.len() {
             pairs.push((reg, lane));
+            for (&i, &j) in lower.iter().zip(&partners).filter_map(|(i, p)| p.as_ref().map(|j| (i, j))) {
+                paired.insert(i, j);
+                paired_uppers.insert(j);
+            }
+        } else if mixed {
+            // Pair the saves/restores that do match `(reg, lane)` + `(reg, lane + 1)`
+            // cleanly, even if another live range reuses one of the lanes as a single
+            // 32-bit spill; unpaired ones become individual 32-bit moves on the same slots.
+            let mut counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+            for &j in partners.iter().flatten() {
+                *counts.entry(j).or_default() += 1;
+            }
+            let valid: Vec<(usize, usize)> = lower
+                .iter()
+                .zip(&partners)
+                .filter_map(|(&i, &p)| {
+                    let j = p?;
+                    (counts.get(&j).copied() == Some(1) && !paired_uppers.contains(&j)).then_some((i, j))
+                })
+                .collect();
+            if !valid.is_empty() {
+                pairs.push((reg, lane));
+                for (i, j) in valid {
+                    paired.insert(i, j);
+                    paired_uppers.insert(j);
+                }
+            }
         }
     }
     // Codes for the parked scalars: the trap temporaries (108..=123), then
@@ -450,15 +497,14 @@ fn unspill(
             continue;
         };
         let Some(slot) = code_of(reg, lane) else { return Vec::new() };
-        if pairs.contains(&(reg, lane)) {
-            let Some(j) = partner(i) else { return Vec::new() };
+        if let Some(&j) = paired.get(&i) {
             // A save moves the pair where its second half is saved; a
             // restore where its first half is restored.
             let (at, gone) = if save { (j, i) } else { (i, j) };
             let (dst, src) = if save { (slot, code) } else { (code, slot) };
             edits.push((at, Some((true, dst, src))));
             edits.push((gone, None));
-        } else if lane > 0 && pairs.contains(&(reg, lane - 1)) {
+        } else if paired_uppers.contains(&i) {
             // the upper half of a pair: moved with the lower
         } else {
             let (dst, src) = if save { (slot, code) } else { (code, slot) };

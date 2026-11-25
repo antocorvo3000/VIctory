@@ -6,8 +6,8 @@
 //! near `1.0`, turn-range reduction for `v_sin_*`/`v_cos_*`, and the LDS
 //! float atomics `ds_min_f32`/`ds_max_f32`.
 
-use super::host::{Dispatch, Host, Root, View};
-use super::{HostShader, lower, validator};
+use super::host::{Dispatch, Host, Root, Stride, View};
+use super::{HostShader, SLOT_STRIDES, VIEW_INTEGER, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -223,6 +223,8 @@ fn lower_words(words: Vec<u32>, threads: u32, lds_bytes: u32, rsrc2: u32) -> Hos
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
+        writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: res.root_indexed_views,
     };
 
@@ -329,6 +331,115 @@ fn f16_to_f32(bits: u16) -> f32 {
         _ => sign | ((u32::from(exp) + 112) << 23) | (u32::from(mant) << 13),
     };
     f32::from_bits(f32_bits)
+}
+
+/// MTBUF `op vdata, off, s[srsrc:srsrc+3], 0 format:format` (at byte 0).
+const fn mtbuf(op: u8, vdata: u8, srsrc: u8, format: u8) -> [u32; 2] {
+    [
+        0x3A << 26 | (format as u32 & 0x7F) << 19 | (op as u32 & 7) << 16,
+        0x80 << 24
+            | (op as u32 >> 3 & 1) << 21
+            | (srsrc as u32 >> 2 & 0x1F) << 16
+            | (vdata as u32) << 8,
+    ]
+}
+
+/// Stores `v1` to the buffer, then reads it back into `v0` with the tbuffer
+/// load `op` in buffer format `format`.
+fn tbuffer_load_of_v1(op: u8, format: u8) -> HostShader {
+    let mut body = buffer_store_dword(1, 8, 0).to_vec();
+    body.extend(mtbuf(op, 0, 8, format));
+    build_valu_cs(&body)
+}
+
+#[test]
+fn normalized_buffer_formats_load_their_ends_exactly() {
+    let x = 0;
+    let cases: &[(u8, u32, f32)] = &[
+        (1, 0xFF, 1.0),
+        (7, 0xFFFF, 1.0),
+        (2, 0x7F, 1.0),
+        (2, 0x81, -1.0),
+        (2, 0x80, -1.0),
+        (8, 0x7FFF, 1.0),
+        (8, 0x8001, -1.0),
+        (8, 0x8000, -1.0),
+    ];
+    for &(format, stored, want) in cases {
+        let shader = tbuffer_load_of_v1(x, format);
+        run_cases(&shader, &[[stored, 0, 0, 0]], |backend, _, _, got| {
+            assert_eq!(
+                got,
+                want.to_bits(),
+                "{backend}: format {format} of {stored:#x} = {got:#010x}, want {want}",
+            );
+        });
+    }
+}
+
+/// Codes of the normalized formats sampled below: every 8-bit code; for
+/// 16 bits a stride and the edges.
+fn normalized_codes(bits: u32) -> Vec<u32> {
+    if bits <= 10 {
+        return (0..1 << bits).collect();
+    }
+    let edges = [
+        1, 2, 3, 255, 256, 257, 261, 265, 269, 511, 512, 1000, 0x7FFF, 0x8000, 0x8001, 0xFFFE,
+    ];
+    (0..=0xFFFF).step_by(257).chain(edges).collect()
+}
+
+/// Every normalized code loads as the float nearest its exact quotient:
+/// unsigned and signed, 8, 10 (the x channel of 2_10_10_10) and 16 bits,
+/// the signed formats' two lowest codes -1.0.
+#[test]
+fn normalized_buffer_formats_load_correctly_rounded_quotients() {
+    let x = 0;
+    for (format, bits, signed) in [
+        (1u8, 8u32, false),
+        (7, 16, false),
+        (2, 8, true),
+        (8, 16, true),
+        (50, 10, false),
+        (51, 10, true),
+    ] {
+        let shader = tbuffer_load_of_v1(x, format);
+        let cases: Vec<[u32; 4]> = normalized_codes(bits).iter().map(|&a| [a, 0, 0, 0]).collect();
+        run_cases(&shader, &cases, |backend, _, [a, ..], got| {
+            let want = if signed {
+                let top = (1i32 << (bits - 1)) - 1;
+                let s = ((a << (32 - bits)) as i32) >> (32 - bits);
+                (s.max(-top) as f32 / top as f32).to_bits()
+            } else {
+                (a as f32 / ((1u32 << bits) - 1) as f32).to_bits()
+            };
+            let sign = if signed { "signed" } else { "unsigned" };
+            assert_eq!(
+                got, want,
+                "{backend}: {bits}-bit {sign} normalized {a:#x} loads as {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
+}
+
+/// Truncating `x * (2^n - 1)` back to the code stored (material index from
+/// a vertex colour's alpha): every code comes back as itself on hardware and WARP.
+#[test]
+fn normalized_codes_truncate_back_to_themselves() {
+    let x = 0;
+    for (format, bits) in [(1u8, 8u32), (7, 16)] {
+        let scale = (((1u32 << bits) - 1) as f32).to_bits();
+        let mut body = buffer_store_dword(1, 8, 0).to_vec();
+        body.extend(mtbuf(x, 0, 8, format));
+        // v_mul_legacy_f32 v0, literal, v0; v_cvt_u32_f32 v0, v0.
+        body.extend([0x07 << 25 | 0xFF, scale]);
+        body.push(vop1(0x07, 0, vgpr(0)));
+        let shader = build_valu_cs(&body);
+        let cases: Vec<[u32; 4]> = normalized_codes(bits).iter().map(|&a| [a, 0, 0, 0]).collect();
+        run_cases(&shader, &cases, |backend, _, [a, ..], got| {
+            assert_eq!(got, a, "{backend}: {bits}-bit code {a} comes back as {got}");
+        });
+    }
 }
 
 #[test]
@@ -1667,6 +1778,8 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
+        writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1871,6 +1984,8 @@ fn glc_heap_uav_loads_stores_and_atomics_execute_on_gpu() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
+        writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: res.root_indexed_views.clone(),
     };
 
@@ -1937,4 +2052,270 @@ fn glc_heap_uav_loads_stores_and_atomics_execute_on_gpu() {
         ran == 2,
         "expected both hardware GPU and WARP to run, got {ran}"
     );
+}
+
+const D16_ROUND_TRIP_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0xBE86_0301, // s_mov_b32 s6, s1
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0303,
+    0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], 0x0
+    0xBE94_0302, // s_mov_b32 s20, s2
+    0xBE95_0380, // s_mov_b32 s21, 0
+    0xF408_040A,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[20:21], 0x0
+    0x3406_0083, // v_lshlrev_b32 v3, 3, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE034_1000,
+    0x8003_0103, // buffer_load_dwordx2 v[1:2], v3, s[12:15], 0 offen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE21C_2000,
+    0x8002_0100, // buffer_store_format_d16_xyzw v[1:2], v0, s[8:11], 0 idxen
+    0xE20C_2000,
+    0x8002_0400, // buffer_load_format_d16_xyzw v[4:5], v0, s[8:11], 0 idxen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE074_1000,
+    0x8004_0403, // buffer_store_dwordx2 v[4:5], v3, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+const D16_X_LOAD_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    0xBE86_0301, // s_mov_b32 s6, s1
+    0xBE87_0380, // s_mov_b32 s7, 0
+    0xF408_0403,
+    0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], 0x0
+    0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+    0x7E08_0280, // v_mov_b32 v4, 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE200_2000,
+    0x8002_0400, // buffer_load_format_d16_x v4, v0, s[8:11], 0 idxen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0xE070_1000,
+    0x8004_0403, // buffer_store_dword v4, v3, s[16:19], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+fn build_tables_cs(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    threads: u32,
+) -> HostShader {
+    let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 32,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: sgprs.max(1) << 1,
+            threads: [threads, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    let mut v = validator::Validator::load(validator::Validator::default_path().as_deref())
+        .expect("dxil.dll validator must load");
+    let mut copy = lowered.dxil.clone();
+    v.validate(&mut copy).expect("DXIL validation failed");
+    HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
+        writes_guest_memory: lowered.writes_guest_memory,
+        root_indexed_views: res.root_indexed_views,
+    }
+}
+
+fn run_tables(
+    shader: &HostShader,
+    views: &[View],
+    strides: Vec<u32>,
+) -> Vec<(&'static str, Vec<Vec<u32>>)> {
+    assert_eq!(shader.root_srvs, [SLOT_STRIDES]);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = 32 * u32::from(u.slot);
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: strides.clone(),
+                            },
+                        ),
+                    ],
+                    views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        out.push((label, words));
+    }
+    assert!(
+        !out.is_empty(),
+        "neither hardware nor WARP SM 6.6 device available"
+    );
+    out
+}
+
+fn d16_table_param(slot: u8) -> RootParam {
+    RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: slot,
+        slot,
+    }
+}
+
+fn d16_used_entry(kind: ResourceType, dwords: u8, slot: u8) -> UsedResource {
+    UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords,
+        user_data: slot,
+        slot,
+    }
+}
+
+#[test]
+fn d16_typed_buffer_accesses_pass_bits_through_integer_views() {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UINT,
+    };
+    let shader = build_tables_cs(
+        D16_ROUND_TRIP_WAVE32,
+        vec![d16_table_param(0), d16_table_param(1), d16_table_param(2)],
+        vec![
+            d16_used_entry(ResourceType::Uav, 4, 0),
+            d16_used_entry(ResourceType::Srv, 4, 1),
+            d16_used_entry(ResourceType::Uav, 4, 2),
+        ],
+        32,
+    );
+    let bits: Vec<u32> = (0..32u32)
+        .flat_map(|l| [(0x8000 | l) | (0x7C01 + l) << 16, (1 + l) | (0xFFFF - l) << 16])
+        .collect();
+    let halves: Vec<u32> = (0..32u32)
+        .flat_map(|l| [(0x3C00 + l) | (0xC000 + 3 * l) << 16, (0x1400 + l) | (0x5BFF - l) << 16])
+        .collect();
+    let cases: [(DXGI_FORMAT, u32, &[u32]); 2] = [
+        (DXGI_FORMAT_R16G16B16A16_UINT, 8 | VIEW_INTEGER, &bits),
+        (DXGI_FORMAT_R16G16B16A16_FLOAT, 8, &halves),
+    ];
+    for (format, stride, data) in cases {
+        let views = [
+            View::TypedUav(format, 32, 8),
+            View::Buffer {
+                data,
+                stride: Stride::Raw,
+            },
+            View::RawUav(64),
+        ];
+        for (label, words) in run_tables(&shader, &views, vec![stride, 4, 4]) {
+            assert_eq!(words[0], data, "{label} {format:?}: the typed view's bytes");
+            assert_eq!(words[1], data, "{label} {format:?}: what the loads read");
+        }
+    }
+}
+
+#[test]
+fn d16_x_loads_read_r16_uint_and_r16_float_views() {
+    use windows::Win32::Graphics::Dxgi::Common::{
+        DXGI_FORMAT, DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_UINT,
+    };
+    let shader = build_tables_cs(
+        D16_X_LOAD_WAVE32,
+        vec![d16_table_param(0), d16_table_param(1)],
+        vec![
+            d16_used_entry(ResourceType::Srv, 4, 0),
+            d16_used_entry(ResourceType::Uav, 4, 1),
+        ],
+        32,
+    );
+    let pack = |h: &dyn Fn(u32) -> u32| -> Vec<u32> {
+        (0..16u32).map(|k| h(2 * k) | h(2 * k + 1) << 16).collect()
+    };
+    let uint = |l: u32| 0xF000 | l;
+    let half = |l: u32| 0x3C00 + 5 * l;
+    let cases: [(DXGI_FORMAT, u32, Vec<u32>, Vec<u32>); 2] = [
+        (
+            DXGI_FORMAT_R16_UINT,
+            2 | VIEW_INTEGER,
+            pack(&uint),
+            (0..32).map(uint).collect(),
+        ),
+        (
+            DXGI_FORMAT_R16_FLOAT,
+            2,
+            pack(&half),
+            (0..32).map(half).collect(),
+        ),
+    ];
+    for (format, stride, data, want) in cases {
+        let views = [
+            View::Buffer {
+                data: &data,
+                stride: Stride::Format(format, 2),
+            },
+            View::RawUav(32),
+        ];
+        for (label, words) in run_tables(&shader, &views, vec![stride, 4]) {
+            assert_eq!(words[0], want, "{label} {format:?}");
+        }
+    }
 }

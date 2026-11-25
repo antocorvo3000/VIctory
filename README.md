@@ -11,8 +11,8 @@ decrypts anything or works around any protection, and no game files are included
 |---|---|
 | Boot, intro video, start screen, menus | work |
 | Loading into the world | works, no failed DirectStorage reads |
-| The world (prologue) | drawn and lit; characters complete; **textures almost all complete**; more of the scene drawn (about 5,900 draws a frame) |
-| Speed in the world | **2.6-3 fps** with up to ~6,800 draws a frame, Series X mode, no upscaling |
+| The world (prologue) | drawn and lit; characters and hair complete; **picture almost complete once loaded**; cutscenes load much more |
+| Speed in the world | **4.3-5 fps** (about 230 ms a frame, the card ~70% busy), Series X mode, no upscaling |
 | Stability | 17 min in the world without a crash or device removal |
 | Memory | about 28 GB committed |
 
@@ -21,8 +21,8 @@ Screenshots from my RX 6800 XT (prologue, Series X mode, 2-3 fps shown in the wi
 ![The cell at sunset, by the window](docs/screenshots/cell-window.png)
 ![The cell, sunlight on the wall](docs/screenshots/cell-sink.png)
 
-Still wrong: low frame rate (the submitting thread still waits for the card about 180 ms a frame: being worked on);
-the title's ray-traced light does not run yet, so a constant ambient light stands in for it (see below).
+Still wrong: the title's ray-traced light does not run by default yet (`VICTORY_RAYS=1` is experimental), so a
+constant ambient light stands in for it; textures can still pop in late.
 
 ## What this build adds
 
@@ -34,17 +34,34 @@ the title's ray-traced light does not run yet, so a constant ambient light stand
   copies (`VICTORY_TEXTURE_CAST`, on; an A8_UNORM view that removed the device is fixed); planar
   depth-stencil planes and block-compressed sizes that are not multiples of 4 are uploaded.
 - **CPU/GPU waits:** settles for title memory changed under shader writes ask the page guards instead of assuming a
-  write (`VICTORY_STALE_ASK`, on), and can wait only for the submissions concerned (`VICTORY_STALE_PRECISE=1`).
+  write (`VICTORY_STALE_ASK`, on), and wait only for the submissions concerned (`VICTORY_STALE_PRECISE`, on).
 - **Video memory and geometry (on):** pooled upload/readback buffers, kept texture hashes (a texture is checked for
   title writes when the list is recorded, so a rewritten one is uploaded in the same frame), staging buffers dropped
   after rare uploads, LRU eviction only while the card is over its target and never for a texture a view slot still
   names; wave64 mesh shaders exchange first-lane reads across their two 32-lane halves (web triangles and deformed
   faces); read-only raw views off 16-byte alignment get their own copy (writable ones stay on the shared copy); heap
   buffer reads wait for the UAV writes before them (skinned characters). `VICTORY_<NAME>=0` turns each off.
-- **Off by default** (no speed gain measured, one of them dims reflected light): copies
-  (`VICTORY_CARD_FETCH_INFLIGHT`, `VICTORY_RELAY_WIDE_MERGE`, `VICTORY_COPY_DIFF`, `VICTORY_HEAP_PASS_WIDE`) and CPU
-  recording caches (`VICTORY_DRAW_STATE_CACHE`, `VICTORY_TABLE_CACHE`, `VICTORY_RECORD_PARALLEL`, timings
-  `VICTORY_RECORD_TIMING`). Set one to `1` to try it.
+- **Off by default** (no gain measured, one of them dims reflected light): 4 KiB copy diffs (`VICTORY_COPY_DIFF`),
+  the wide heap pass (`VICTORY_HEAP_PASS_WIDE`), draw state and table caches (`VICTORY_DRAW_STATE_CACHE`,
+  `VICTORY_TABLE_CACHE`); timings with `VICTORY_RECORD_TIMING=1`.
+- **Recording the title's commands in parallel (on):** the descriptor heap's made/kept slots are sharded and read
+  without locks, the heap buffer view pass is incremental and sharded, made descriptor tables are found again by
+  their records (`VICTORY_TABLE_REUSE=fresh`; `=1` also covers the title's own slots and is still wrong for hair),
+  recording takes shared locks (`VICTORY_RECORD_PARALLEL`). Lock waits went from about 950 to 36 ms a frame and the
+  heap buffer pass from 720-7,300 to about 100 ms.
+- **CPU and GPU waits (on):** stale pages are byte-checked before settling the work in flight (29 of 30 settles
+  were false alarms), presents go behind the work in flight (`VICTORY_ASYNC_PRESENT`), settles wait only for the
+  submissions concerned, and the relay fetches pieces from the card while it runs and merges them on several
+  threads (`VICTORY_CARD_FETCH_INFLIGHT`, `VICTORY_RELAY_WIDE_MERGE`).
+- **Title memory in place (on, `VICTORY_INPLACE=1`):** view memory the title maps 64 KiB at a time is used by the
+  card through a second view of its section when a range is one run (and runs of 4 MiB or more inside a cell with
+  holes, `VICTORY_RUN_LEAST_MB`): no copy up, no copy back.
+- **Shader translation fixes:** pixel quad reads reach helper lanes (lines along triangles on skin, glass and car
+  paint on AMD), helper-lane first-lane reads, normalized buffer conversions, rectangles completed opposite their
+  right angle, descriptors joined through nested control flow, ray-traced shadow and water programs translate.
+- **Experimental, off by default:** ray tracing (`VICTORY_RAYS=1`: structure builders, ray shaders, ray memory;
+  the ambient light steps aside), textures detiled on the card (`VICTORY_GPU_DETILE=1`: right, but too slow while
+  it re-detiles whole textures), copy-back on first CPU access (`VICTORY_DEFER_COPYBACK=1`: can hang).
 - **Ambient light where ray-traced light does not run:** the output of the title's indirect diffuse resolve
   (`CS_ScreenProbes_TemporalResolve`), which without rays holds garbage (magenta on leaves, cloth and paper, blocks of
   colour indoors), is replaced by a constant (`VICTORY_AMBIENT=<level>`, 0.6 by default; `off` keeps the title's

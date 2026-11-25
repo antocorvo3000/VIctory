@@ -87,7 +87,7 @@ pub(crate) fn probe_level() -> u8 {
 /// call before such a call once it takes them over.
 pub(crate) fn level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
 }
 
 /// The most title memory in place at once, in bytes
@@ -103,6 +103,12 @@ fn most() -> u64 {
 /// or not private memory committed whole, because the host refused,
 /// because of [`most`]; and what was let go because its memory changed.
 static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Why title memory was turned down, as (count, bytes) pairs: view memory
+/// with holes, view memory scattered over sections or places, view memory
+/// of another kind, a run whose aligned stretch was not one run or could
+/// not be mapped again, private memory not committed whole.
+static WHY: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
@@ -139,16 +145,27 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         return None;
     }
     // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
+    let run = match cover(start as usize, len as usize) {
+        Cover::None => None,
+        Cover::Run(section, offset) if stretch_on() => Some((section, offset)),
+        other => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            let k = match other { Cover::Holes => 0, Cover::Scattered => 1, _ => 2 };
+            WHY[k * 2].fetch_add(1, Ordering::Relaxed);
+            WHY[k * 2 + 1].fetch_add(len, Ordering::Relaxed);
+            return None;
+        }
+    };
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
+    let placed = match run {
+        Some((section, offset)) => place_view_run(&host.device, start, len, section, offset),
+        None => place_part(&host.device, start, len),
+    };
+    match placed {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
@@ -157,6 +174,9 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         }
         Err(None) => {
             STATS[4].fetch_add(1, Ordering::Relaxed);
+            let k = if run.is_some() { 3 } else { 4 };
+            WHY[k * 2].fetch_add(1, Ordering::Relaxed);
+            WHY[k * 2 + 1].fetch_add(len, Ordering::Relaxed);
             None
         }
         Err(Some(e)) => {
@@ -164,6 +184,71 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
                 tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "title memory not opened in place: a copy instead");
             }
             None
+        }
+    }
+}
+
+/// Whether title memory the title shows through its own views (the page
+/// pool: one 64 KiB view at a time, each its own allocation, which the host
+/// cannot open as one heap) is put in place when the range is one run of one
+/// section (`VICTORY_STRETCH=0` turns it off): the run is mapped once more,
+/// whole, at an address of ours and the host heap is opened there. The same
+/// pages, so nothing is copied and nothing comes back; the title's views
+/// stay as they are.
+/// shortcut: the view of ours is never unmapped (a heap holds it while it
+/// lives, and the window may outlive the title's views); it costs address
+/// space and keeps those pages of the section alive.
+fn stretch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STRETCH").is_none_or(|v| v != "0"))
+}
+
+/// [`place_part`] for view memory: `[start, start + len)` is one run of
+/// `section` from `offset` (the offset of `start`) on.
+fn place_view_run(device: &ID3D12Device, start: u64, len: u64, section: usize, offset: u64) -> Result<Placed, Option<windows::core::Error>> {
+    let at = start & !(K64 as u64 - 1);
+    let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let from = offset.checked_sub(start - at).ok_or(None)?;
+    // The whole 64 KiB-aligned stretch must be the same run.
+    if cover(at as usize, bytes as usize) != Cover::Run(section, from) {
+        return Err(None);
+    }
+    // SAFETY: a section the runtime told us of (alive while the title has
+    // views of it); the stretch lies inside it.
+    let view = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, (from >> 32) as u32, from as u32, bytes as usize) };
+    if view.Value.is_null() {
+        if STATS[5].load(Ordering::Relaxed) < 8 {
+            tracing::warn!(
+                error = %std::io::Error::last_os_error(),
+                start = format_args!("{start:#x}"),
+                bytes,
+                "a run of view memory could not be mapped again"
+            );
+        }
+        return Err(None);
+    }
+    let ours = view.Value as usize;
+    // Read-only guards over the title's bytes would refuse the GPU's writes.
+    crate::watch::writing(at as usize, bytes as usize);
+    let opened = open(device, From::Part(ours, bytes as usize)).and_then(|heap| {
+        let buffer = place(device, &heap, 0, bytes)?;
+        Ok((heap, buffer))
+    });
+    match opened {
+        Ok((heap, buffer)) => {
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
+            static COUNT: AtomicU64 = AtomicU64::new(0);
+            let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if count <= 16 || count.is_power_of_two() {
+                tracing::info!(count, start = format_args!("{start:#x}"), bytes, "view memory in place through a view of ours");
+            }
+            Ok(Placed { buffer, heap, gpu, bias: start - at })
+        }
+        Err(e) => {
+            // SAFETY: our view, used by nothing.
+            unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value }) };
+            Err(Some(e))
         }
     }
 }
@@ -209,6 +294,11 @@ fn say() {
         s[5],
         s[6],
         s[7]
+    );
+    let w: Vec<u64> = WHY.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    tracing::info!(
+        "title memory turned down, by why (asks, MB): view memory with holes {} {}, scattered {} {}, other {} {}; a run not mappable {} {}; private not committed whole {} {}",
+        w[0], w[1] >> 20, w[2], w[3] >> 20, w[4], w[5] >> 20, w[6], w[7] >> 20, w[8], w[9] >> 20
     );
 }
 
@@ -401,6 +491,107 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
     runs
 }
 
+/// Physical backing, clipped to the virtual range being changed. A split
+/// Windows view may still show the same section bytes on either side.
+#[derive(Clone, Copy)]
+pub(crate) struct PhysicalSpan {
+    start: usize,
+    end: usize,
+    section: usize,
+    offset: u64,
+}
+
+pub(crate) fn physical_spans(range: &std::ops::Range<usize>) -> Vec<PhysicalSpan> {
+    if range.is_empty() {
+        return Vec::new();
+    }
+    let v = views();
+    let search = v
+        .views
+        .range(..=range.start)
+        .next_back()
+        .map_or(range.start, |(&at, _)| at);
+    v.views
+        .range(search..range.end)
+        .filter_map(|(&base, &(size, section, offset))| {
+            let start = range.start.max(base);
+            let end = range.end.min(base.saturating_add(size));
+            (start < end).then_some(PhysicalSpan {
+                start,
+                end,
+                section,
+                offset: offset + (start - base) as u64,
+            })
+        })
+        .collect()
+}
+
+/// Walk the union of the old and new view boundaries without enumerating
+/// pages. A temporary unmap followed by restoring the same backing is valid.
+pub(crate) fn physical_changes(
+    mut old: &[PhysicalSpan],
+    mut new: &[PhysicalSpan],
+    mut changed: impl FnMut(std::ops::Range<usize>),
+) {
+    let mut at = old
+        .first()
+        .into_iter()
+        .chain(new.first())
+        .map(|s| s.start)
+        .min()
+        .unwrap_or(0);
+    while !old.is_empty() || !new.is_empty() {
+        let interval = |list: &[PhysicalSpan]| match list.first() {
+            Some(s) if s.start <= at => {
+                (s.end, Some((s.section, s.offset + (at - s.start) as u64)))
+            }
+            Some(s) => (s.start, None),
+            None => (usize::MAX, None),
+        };
+        let (old_end, old_bytes) = interval(old);
+        let (new_end, new_bytes) = interval(new);
+        let end = old_end.min(new_end);
+        if old_bytes != new_bytes {
+            changed(at..end);
+        }
+        if old.first().is_some_and(|s| s.end == end) {
+            old = &old[1..];
+        }
+        if new.first().is_some_and(|s| s.end == end) {
+            new = &new[1..];
+        }
+        at = end;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn physical_replacement_keeps_the_unchanged_neighbors_of_a_split_view() {
+    let span = |start, end, section, offset| PhysicalSpan {
+        start,
+        end,
+        section,
+        offset,
+    };
+    let old = [span(100, 400, 1, 1000)];
+    let split = [
+        span(100, 200, 1, 1000),
+        span(200, 300, 2, 0),
+        span(300, 400, 1, 1200),
+    ];
+    let mut changed = Vec::new();
+    physical_changes(&old, &split, |r| changed.push(r));
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0], 200..300);
+    changed.clear();
+    physical_changes(&split, &split, |r| changed.push(r));
+    assert!(changed.is_empty());
+    let shifted = [span(100, 400, 1, 2000)];
+    physical_changes(&old, &shifted, |r| changed.push(r));
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0], 100..400);
+}
+
 /// How the views cover `[at, at + len)`.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Cover {
@@ -430,6 +621,40 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
         reached += bytes;
     }
     if one { Cover::Run(first.0, first.1) } else { Cover::Scattered }
+}
+
+/// The longest run of the title's views (one after another in memory and
+/// in their section alike) that holds `[at, end)`, cut to `[lo, hi)`: its
+/// start and bytes. `None` if no single run holds it. For a window whose
+/// cell has holes: the part of it that can be put in place.
+pub(crate) fn run_around(at: u64, end: u64, lo: u64, hi: u64) -> Option<(u64, u64)> {
+    let v = views();
+    let (at, end, lo, hi) = (at as usize, end as usize, lo as usize, hi as usize);
+    let (&first, &(n, section, offset)) = v.views.range(..=at).next_back()?;
+    if first + n <= at {
+        return None;
+    }
+    // Up from the view holding `at`.
+    let (mut stop, mut next) = (first + n, offset + n as u64);
+    while stop < hi {
+        match v.views.get(&stop) {
+            Some(&(n, s, o)) if s == section && o == next => (stop, next) = (stop + n, o + n as u64),
+            _ => break,
+        }
+    }
+    if stop < end {
+        return None;
+    }
+    // And down from it.
+    let (mut start, mut from) = (first, offset);
+    while start > lo {
+        match v.views.range(..start).next_back() {
+            Some((&a, &(n, s, o))) if a + n == start && s == section && o + n as u64 == from => (start, from) = (a, o),
+            _ => break,
+        }
+    }
+    let (start, stop) = (start.max(lo), stop.min(hi));
+    (start <= at && stop >= end).then_some((start as u64, (stop - start) as u64))
 }
 
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
@@ -1136,6 +1361,30 @@ mod tests {
     }
 
     /// What the runtime forgets when memory is mapped anew.
+    #[test]
+    fn the_run_around_an_ask_is_cut_to_its_cell_and_stops_at_a_gap() {
+        // Fake addresses far from anything real; views of one section that
+        // follow one another, then one out of order, then a hole.
+        let at = 0x6d00_0000_0000usize;
+        title_memory_view(at, 2 * K64, 91, 0);
+        title_memory_view(at + 2 * K64, K64, 91, 2 * K64 as u64);
+        title_memory_view(at + 3 * K64, K64, 91, 7 * K64 as u64);
+        let cell = (at as u64, at as u64 + 16 * K64 as u64);
+        // An ask in the first run: the run, three views long.
+        assert_eq!(run_around(at as u64 + 100, at as u64 + 200, cell.0, cell.1), Some((at as u64, 3 * K64 as u64)));
+        // Cut to the cell.
+        assert_eq!(
+            run_around(at as u64 + K64 as u64 + 8, at as u64 + K64 as u64 + 16, at as u64 + K64 as u64, cell.1),
+            Some((at as u64 + K64 as u64, 2 * K64 as u64))
+        );
+        // Across the break in the section: no single run.
+        assert_eq!(run_around(at as u64 + 3 * K64 as u64 - 8, at as u64 + 3 * K64 as u64 + 8, cell.0, cell.1), None);
+        // In the hole after the last view.
+        assert_eq!(run_around(at as u64 + 5 * K64 as u64, at as u64 + 5 * K64 as u64 + 1, cell.0, cell.1), None);
+        views_gone(at, 4 * K64);
+        assert_eq!(run_around(at as u64 + 100, at as u64 + 200, cell.0, cell.1), None);
+    }
+
     #[test]
     fn remapped_memory_forgets_its_views() {
         let at = 0x7_4000_0000usize;

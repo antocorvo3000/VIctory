@@ -105,11 +105,21 @@ fn lowered_on(
     wide: &HashSet<usize>,
     host_wave: u32,
 ) -> Result<HostShader, ShaderError> {
+    lowered_for_dispatch(native, p, wide, host_wave, false)
+}
+
+fn lowered_for_dispatch(
+    native: &NativeProgram,
+    p: &ir::Program,
+    wide: &HashSet<usize>,
+    host_wave: u32,
+    partial: bool,
+) -> Result<HostShader, ShaderError> {
     let st = structure::structure_wide(p, wide).expect("structure");
     let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(p, native).expect("io::raise");
     let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
-    let lowered = lower::lower(&lower::Parts {
+    let lowered = lower::lower_with_thread_limit(&lower::Parts {
         native,
         p,
         st: &st,
@@ -119,7 +129,7 @@ fn lowered_on(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    });
+    }, partial);
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
     Ok(HostShader {
@@ -131,8 +141,47 @@ fn lowered_on(
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
+        writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: res.root_indexed_views,
     })
+}
+
+#[test]
+fn partial_thread_dispatch_masks_the_final_groups_memory_writes() {
+    // Each active thread increments counter[local X]. With two groups the
+    // tail's first N lanes report two increments, the others only one.
+    let native = native(&[
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x7e04_0281, // v_mov_b32 v2, 1
+        0xe0c8_1000, 0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let shader = lowered_for_dispatch(&native, &p, &HashSet::new(), 64, true).unwrap();
+    let limit = shader.user_data.iter().find(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS_X)).unwrap();
+    assert_eq!((limit.slot, limit.dword), (0, 64));
+    let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref()).unwrap();
+    validator.validate(&mut shader.dxil.clone()).unwrap();
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(true) else { return };
+    let (root, pso) = host.compute_pipeline(&shader).unwrap();
+    for count in [0u32, 1, 7, 63, 64, 65, 74, 77, 127, 128] {
+        let mut constants = vec![0; shader.user_data_dwords() as usize];
+        constants[limit.index as usize] = count;
+        let result = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(constants))],
+            views: &[View::RawUav(68)],
+            samplers: &[],
+            groups: [2, 1, 1],
+        }).unwrap();
+        let active = if count == 0 { 128 } else { count };
+        for (i, &word) in result[0].iter().enumerate() {
+            let expected = if i < 64 {
+                u32::from((i as u32) < active) + u32::from((i as u32 + 64) < active)
+            } else { 0 };
+            assert_eq!(word, expected, "count {count}, word {i}");
+        }
+    }
 }
 
 #[test]
@@ -529,6 +578,160 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         assert_eq!(got, expected, "{below} lanes inside, s1 = {s1}");
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
+}
+
+/// A 64-lane compute wave. A lane mask holding lanes outside `EXEC` (saved before a
+/// per-lane branch and restored inside it) is later parked in two neighbouring lanes of a
+/// VGPR (`v_writelane_b32` / `v_readlane_b32`), while an unrelated 32-bit scalar reuses the
+/// lower lane later in the program (`water_shading:CS_TransmissionVolumetrics`,
+/// `water_shading:CS_TransmissionVolumetricsSubmerged`). With `VICTORY_UNSPILL_MIXED_PAIRS=0`
+/// the pair was left as 32-bit moves and lost its mask tracking; pairing matching saves and
+/// saves and restores as `s_mov_b64` keeps the mask tracked through the spill while leaving
+/// the 32-bit spill on the same slot.
+#[test]
+fn parked_mask_pair_sharing_a_lane_with_a_scalar_spill() {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ir::TEST_UNSPILL_MIXED_PAIRS.set(self.0);
+        }
+    }
+    let _reset = Reset(ir::TEST_UNSPILL_MIXED_PAIRS.replace(Some(false)));
+    let words = [
+        0x7D88_0000, // 0: v_cmp_gt_u32 vcc, s0, v0
+        0xBE94_046A, // 1: s_mov_b64 s[20:21], vcc
+        0xBE8C_047E, // 2: s_mov_b64 s[12:13], exec
+        0xBF06_8001, // 3: s_cmp_eq_u32 s1, 0
+        0xBF85_0007, // 4: s_cbranch_scc1 -> join (12)
+        0xBE8E_0414, // 5: s_mov_b64 s[14:15], s[20:21]
+        0x7D88_0090, // 6: v_cmp_gt_u32 vcc, 16, v0
+        0xBE8C_246A, // 7: s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0003, // 8: s_cbranch_execz -> join (12)
+        0xBE94_0480, // 9: s_mov_b64 s[20:21], 0
+        0xBE94_040E, // 10: s_mov_b64 s[20:21], s[14:15]
+        0xBF80_0000, // 11: s_nop 0
+        0xBEFE_040C, // 12: join: s_mov_b64 exec, s[12:13]
+        0xD761_0005,
+        0x0001_0414, // 13: v_writelane_b32 v5, s20, 2
+        0x7E04_0280, // 15: v_mov_b32 v2, 0
+        0xD761_0005,
+        0x0001_0615, // 16: v_writelane_b32 v5, s21, 3
+        0xBE94_0480, // 18: s_mov_b64 s[20:21], 0
+        0xD760_0014,
+        0x0001_0505, // 19: v_readlane_b32 s20, v5, 2
+        0xD760_0015,
+        0x0001_0705, // 21: v_readlane_b32 s21, v5, 3
+        0xD761_0005,
+        0x0001_0401, // 23: v_writelane_b32 v5, s1, 2
+        0xD760_0016,
+        0x0001_0505, // 25: v_readlane_b32 s22, v5, 2
+        0xD501_0001,
+        0x0051_0280, // 27: v_cndmask_b32 v1, 0, 1, s[20:21]
+        0x4A02_0216, // 29: v_add_nc_u32 v1, s22, v1
+        0x7DA4_0094, // 30: v_cmpx_eq_u32 exec, 20, v0
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 1 << 8, // 31: buffer_store_dword v1, off, s[8:11], 0
+    ];
+    let native = native(&words);
+    let p_off = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build off");
+    let err = lowered_on(&native, &p_off, &HashSet::new(), 64);
+    assert!(
+        matches!(&err, Err(ShaderError::Unsupported { what, .. }) if *what == "a select on an untracked mask"),
+        "{:?}",
+        err.err()
+    );
+    ir::TEST_UNSPILL_MIXED_PAIRS.set(Some(true));
+    let p_on = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build on");
+    let insts: Vec<&str> = p_on.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).collect();
+    assert!(!insts.contains(&"v_writelane_b32") && !insts.contains(&"v_readlane_b32"));
+    assert_eq!(insts.iter().filter(|&&n| n == "s_mov_b64").count(), 9);
+    assert_eq!(insts.iter().filter(|&&n| n == "s_mov_b32").count(), 3); // s5 + 2 mixed scalar spills
+    let shader = lowered_on(&native, &p_on, &HashSet::new(), 64).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (below, s1, expected) in [(32u32, 0u32, 1u32), (16, 0, 0), (32, 3, 4), (16, 3, 3)] {
+        let Some(got) = on_the_card(&shader, [below, s1]) else { return };
+        assert_eq!(got, expected, "lane 20 with {below} lanes in mask, s1 = {s1}");
+    }
+    eprintln!("ran on the hardware device: mixed-width unspill preserves parked mask pair");
+}
+
+/// A PHI joining a leftover lane mask on one arm with an opaque scalar (such as
+/// a buffer load) on the other (`shadowmask:CS_TraceShadowRays_FullAdaptive`,
+/// `0x87f4..0xae80`) feeds scalar bitwise packing (`s_and_b32`/`s_or_b32`) and a
+/// vector compare inside a divergent block. With `VICTORY_MIXED_MASK_PHI=0`
+/// the PHI is treated as derived and `s_or_b32` fails as an active-only mask;
+/// enabled, the PHI resolves numerically and downstream bitwise ops emit as data.
+#[test]
+fn mixed_mask_and_opaque_scalar_phi_lowers_downstream_bitwise_ops_as_data() {
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            structure::TEST_MIXED_MASK_PHI.set(self.0);
+        }
+    }
+    let _reset = Reset(structure::TEST_MIXED_MASK_PHI.replace(Some(false)));
+    // s0: input base, s1: branch selector (0 = scalar s0+3, else = 12-lane mask).
+    // On the scalar path s20 = s0 + 3 (opaque scalar); on the mask path
+    // s20 = (v0 < 12) (lane mask 0xFFF). After the join, under a divergent EXEC
+    // (v0 < 16), s22 = s20 & 7, s23 = s22 | (s0 + 8), compared against v0 and
+    // stored from lane 0.
+    let words = [
+        0x8115_8800, //  0: s_add_i32 s21, s0, 8
+        0xBF06_8001, //  1: s_cmp_eq_u32 s1, 0
+        0xBF84_0002, //  2: s_cbranch_scc0 -> mask_arm (5)
+        0x8114_8300, //  3: scalar_arm: s_add_i32 s20, s0, 3
+        0xBF82_0002, //  4: s_branch -> join (7)
+        0x7D88_008C, //  5: mask_arm: v_cmp_gt_u32 vcc_lo, 12, v0
+        0xBE94_036A, //  6: s_mov_b32 s20, vcc_lo
+        0x7E02_0280, //  7: join: v_mov_b32 v1, 0
+        0x7D88_0090, //  8: v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE82_3C6A, //  9: s_and_saveexec_b32 s2, vcc_lo
+        0xBF88_0006, // 10: s_cbranch_execz -> restore (17)
+        0x8716_8714, // 11: s_and_b32 s22, s20, 7
+        0x8817_1516, // 12: s_or_b32 s23, s22, s21
+        0x7D84_0017, // 13: v_cmp_eq_u32 vcc_lo, s23, v0
+        0x7E04_0281, // 14: v_mov_b32 v2, 1
+        0x0204_0480, // 15: v_cndmask_b32 v2, 0, v2, vcc_lo
+        0x4A02_0417, // 16: v_add_nc_u32 v1, s23, v2
+        0xBEFE_0302, // 17: restore: s_mov_b32 exec_lo, s2
+        0x7DA4_0080, // 18: v_cmpx_eq_u32 exec_lo, 0, v0
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16 | 1 << 8, // 19: buffer_store_dword v1, off, s[8:11], 0
+    ];
+    let native = native_of(&words, false, 32);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let err = lowered(&native, &p, &HashSet::new());
+    assert!(
+        matches!(&err, Err(ShaderError::Unsupported { what, .. }) if *what == "a lane mask holding lanes elsewhere read as data"),
+        "{:?}",
+        err.err()
+    );
+
+    structure::TEST_MIXED_MASK_PHI.set(Some(true));
+    let st = structure::structure(&p).expect("structure");
+    let s_or_val = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find(|i| i.name() == "s_or_b32")
+        .and_then(|i| i.write(ir::Reg::S(23)))
+        .expect("s_or_b32 s23");
+    assert!(!st.masks.contains_key(&s_or_val), "s_or_b32 s23 must not be tracked as a lane mask");
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (s0, s1, expected) in [(0u32, 0u32, 11u32), (0, 1, 15)] {
+        let Some(got) = on_the_card(&shader, [s0, s1]) else { return };
+        assert_eq!(got, expected, "s0={s0}, s1={s1}");
+    }
+    eprintln!("ran on the hardware device: mixed mask and opaque scalar PHI keeps bitwise ops as data");
 }
 
 #[test]

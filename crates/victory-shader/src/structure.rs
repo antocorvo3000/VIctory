@@ -16,8 +16,10 @@
 //! their side effects are dropped too, and what they compute is only read
 //! through derivatives.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::OnceLock;
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
@@ -455,6 +457,32 @@ impl Structured {
     }
 }
 
+/// `VICTORY_MIXED_MASK_PHI=0`: a PHI joining a lane mask with an opaque scalar
+/// (such as a leftover mask on a skip edge and a scalar buffer load) still counts
+/// as derived, pulling downstream integer bitwise operations into `masks`.
+fn mixed_mask_phi_on() -> bool {
+    if let Some(on) = TEST_MIXED_MASK_PHI.get() {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MIXED_MASK_PHI").is_none_or(|v| v != "0"))
+}
+
+thread_local! {
+    pub(crate) static TEST_MIXED_MASK_PHI: Cell<Option<bool>> = const { Cell::new(None) };
+    pub(crate) static TEST_SKIP_COMPARE_MASK: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// `VICTORY_SKIP_COMPARE_MASK=0`: lanes skipping a compare's region do not
+/// force the reused register's skip edge in a mask phi to `false`.
+fn skip_compare_mask_on() -> bool {
+    if let Some(on) = TEST_SKIP_COMPARE_MASK.get() {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SKIP_COMPARE_MASK").is_none_or(|v| v != "0"))
+}
+
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     structure_wide(program, &HashSet::new())
@@ -474,15 +502,16 @@ pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Struct
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
-        let (wrong, new_derived) = l.check_joins(&cond);
+        let (wrong, new_derived, new_opaque) = l.check_joins(&cond);
         if l.b.overflow {
             return Err(TOO_LARGE);
         }
-        if wrong.is_empty() && new_derived.is_empty() {
+        if wrong.is_empty() && new_derived.is_empty() && new_opaque.is_empty() {
             return l.finish(&execs, &cond);
         }
         l.unresolved.extend(wrong);
         l.derived_phis.extend(new_derived);
+        l.opaque_phis.extend(new_opaque);
         l.reset();
     }
 }
@@ -507,6 +536,9 @@ struct Lanes<'a> {
     /// Phi ids whose joins depend on EXEC or VALU results (including along
     /// back edges), carried across resets so their joins stay in `masks`.
     derived_phis: HashSet<Value>,
+    /// Phi ids that receive a non-mask opaque scalar on some edge and therefore
+    /// must not be treated as derived lane masks even if another edge is a mask.
+    opaque_phis: HashSet<Value>,
     b: Bools,
     /// Masks derived from EXEC and VALU results.
     masks: Map<Key, Bool>,
@@ -603,6 +635,7 @@ impl<'a> Lanes<'a> {
             phis,
             unresolved: HashSet::new(),
             derived_phis: HashSet::new(),
+            opaque_phis: HashSet::new(),
             b: Bools::new(),
             masks: Map::default(),
             other: Map::default(),
@@ -708,12 +741,40 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    /// Whether `(m, derived)` comes from a non-mask opaque scalar value (rather
+    /// than a mask or mask constant), directly or through a mixed PHI.
+    fn is_opaque_scalar(&self, m: Bool, derived: bool) -> bool {
+        !derived
+            && self.b.support(m).iter().any(|atom| {
+                matches!(atom, Atom::Opaque(_))
+                    || matches!(atom, Atom::Phi(p) if self.opaque_phis.contains(p))
+            })
+    }
+
     /// Joins whose constant fails on some edge, and joins that need another
-    /// pass because a later edge turned out to derive from EXEC or VALU.
-    fn check_joins(&mut self, cond: &[Bool]) -> (Vec<Value>, Vec<Value>) {
+    /// pass because a later edge turned out to derive from EXEC or VALU, or to
+    /// carry an opaque scalar.
+    fn check_joins(&mut self, cond: &[Bool]) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
         let mut wrong = Vec::new();
         let mut new_derived = Vec::new();
+        let mut new_opaque = Vec::new();
         let mut seen_derived = HashSet::new();
+        let mut seen_opaque = HashSet::new();
+        let mixed = mixed_mask_phi_on();
+        let mut record_kind =
+            |this: &Self, id: Value, was_derived: bool, has_opaque: bool, any_derived: bool| {
+                if mixed && has_opaque {
+                    if was_derived && !this.opaque_phis.contains(&id) && seen_opaque.insert(id) {
+                        new_opaque.push(id);
+                    }
+                } else if !was_derived
+                    && any_derived
+                    && !this.derived_phis.contains(&id)
+                    && seen_derived.insert(id)
+                {
+                    new_derived.push(id);
+                }
+            };
         let mut j = 0;
         let mut p = 0;
         // Checking an argument can resolve another join; it is checked too.
@@ -726,16 +787,16 @@ impl<'a> Lanes<'a> {
                     self.joins[j].derived,
                 );
                 let mut failed = false;
-                for (n, a) in self.joins[j].args.clone().into_iter().enumerate() {
+                let args = self.joins[j].args.clone();
+                let mut has_opaque = self.opaque_phis.contains(&id);
+                let mut any_derived = false;
+                for (n, a) in args.into_iter().enumerate() {
                     let (q, taken) = self.incoming[block][n];
                     let e = self.edge(cond[q], q, taken);
                     let (mut m, d) = self.mask(a);
-                    if !was_derived
-                        && d
-                        && !self.derived_phis.contains(&id)
-                        && seen_derived.insert(id)
-                    {
-                        new_derived.push(id);
+                    any_derived |= d;
+                    if mixed && self.is_opaque_scalar(m, d) {
+                        has_opaque = true;
                     }
                     if !value {
                         m = self.b.not(m);
@@ -745,24 +806,26 @@ impl<'a> Lanes<'a> {
                         failed = true;
                     }
                 }
+                record_kind(self, id, was_derived, has_opaque, any_derived);
                 j += 1;
             }
             while p < self.phi_joins.len() {
                 let (id, was_derived) = (self.phi_joins[p].id, self.phi_joins[p].derived);
-                for a in self.phi_joins[p].args.clone() {
-                    let (_, d) = self.mask(a);
-                    if !was_derived
-                        && d
-                        && !self.derived_phis.contains(&id)
-                        && seen_derived.insert(id)
-                    {
-                        new_derived.push(id);
+                let args = self.phi_joins[p].args.clone();
+                let mut has_opaque = self.opaque_phis.contains(&id);
+                let mut any_derived = false;
+                for a in args {
+                    let (m, d) = self.mask(a);
+                    any_derived |= d;
+                    if mixed && self.is_opaque_scalar(m, d) {
+                        has_opaque = true;
                     }
                 }
+                record_kind(self, id, was_derived, has_opaque, any_derived);
                 p += 1;
             }
         }
-        (wrong, new_derived)
+        (wrong, new_derived, new_opaque)
     }
 
     fn finish(
@@ -773,14 +836,46 @@ impl<'a> Lanes<'a> {
         let phi_joins = std::mem::take(&mut self.phi_joins);
         let mut phi_masks = HashMap::with_capacity(phi_joins.len());
         for pj in phi_joins {
-            let incoming: Vec<Bool> = pj
+            let uniform_join = !self.incoming[pj.block].iter().any(|&(q, _)| {
+                self.when[q].is_some_and(|w| {
+                    !self
+                        .b
+                        .support(w)
+                        .iter()
+                        .all(|a| matches!(a, Atom::Uniform(_)))
+                })
+            });
+            let edge_masks: Vec<(Bool, Bool, bool)> = pj
                 .args
-                .into_iter()
+                .iter()
                 .enumerate()
-                .map(|(n, a)| {
+                .map(|(n, &a)| {
                     let (q, taken) = self.incoming[pj.block][n];
                     let e = self.edge(cond[q], q, taken);
-                    let m = self.mask(a).0;
+                    let (m, derived) = self.mask(a);
+                    (e, m, derived)
+                })
+                .collect();
+            let incoming: Vec<Bool> = edge_masks
+                .iter()
+                .enumerate()
+                .map(|(n, &(e, m, derived))| {
+                    if skip_compare_mask_on() && !uniform_join && !derived {
+                        let mut some = false;
+                        let mut disjoint = true;
+                        for (k, &(_, mk, dk)) in edge_masks.iter().enumerate() {
+                            if k != n && dk {
+                                some = true;
+                                if self.b.meet(&[(e, true), (mk, true)]) {
+                                    disjoint = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if some && disjoint {
+                            return Bool::FALSE;
+                        }
+                    }
                     self.b.given(m, e)
                 })
                 .collect();
@@ -897,6 +992,17 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
+        // A scalar pair can be parked in two VGPR lanes and restored one
+        // dword at a time. The spill pass turns these into scalar moves.
+        // Recover the original lane predicate only when the two words
+        // still come from the same known mask, in their original order.
+        if self.p.wave64 && crate::emit::ray_shaders() {
+            let source = (self.move_source(k.0), self.move_source(k.1));
+            if source != k && let Some(&m) = self.masks.get(&source) {
+                self.masks.insert(k, m);
+                return (m, true);
+            }
+        }
         let p = self.p;
         let (m, derived) = match self.join(k) {
             Some(join) => join,
@@ -939,6 +1045,20 @@ impl<'a> Lanes<'a> {
         (m, derived)
     }
 
+    fn move_source(&self, mut value: Value) -> Value {
+        while let Some(&(b, i)) = self.defs.get(&value) {
+            let inst = &self.p.blocks[b].insts[i];
+            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
+                break;
+            };
+            if inst.name() != "s_mov_b32" {
+                break;
+            }
+            value = *source;
+        }
+        value
+    }
+
     /// A mask joined by phis at a block entry, and whether a mask coming in
     /// on a forward edge derives from EXEC or a VALU result. Where every
     /// lane arriving so far has the incoming mask set (or clear), the join
@@ -959,6 +1079,8 @@ impl<'a> Lanes<'a> {
             .map(|n| (arg(lo, k.0, n), arg(hi, k.1, n)))
             .collect();
         let id = lo.map_or(k.1, |_| k.0);
+        let mixed = mixed_mask_phi_on();
+        let mut has_opaque = mixed && self.opaque_phis.contains(&id);
         let mut derived = self.derived_phis.contains(&id);
         // (edge condition, mask) per forward edge; back edges come later.
         let mut forward = Vec::new();
@@ -967,11 +1089,18 @@ impl<'a> Lanes<'a> {
             if self.index[q] < self.index[block] {
                 let (m, d) = self.mask(a);
                 derived |= d;
+                if mixed && self.is_opaque_scalar(m, d) {
+                    has_opaque = true;
+                }
                 let e = self.edge(self.first[q], q, taken);
                 forward.push((e, m));
             } else {
                 self.seen.push(a);
             }
+        }
+        if has_opaque {
+            self.opaque_phis.insert(id);
+            derived = false;
         }
         if forward.len() == args.len()
             && let Some(&(_, m)) = forward.first()
@@ -1691,6 +1820,34 @@ mod tests {
     }
 
     #[test]
+    fn split_scalar_copies_across_a_branch_preserve_both_words_of_a_wave64_mask() {
+        crate::emit::with_ray_shaders(true, || {
+            for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
+                let p = build(
+                    &[
+                        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                        0xBE84_046A, // s_mov_b64 s[4:5], vcc
+                        0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                        0xBF85_0004, // s_cbranch_scc1 -> join at 32
+                        0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                        high,        // s_mov_b32 s3, vcc_hi (or vcc_lo)
+                        0xBE84_0302, // s_mov_b32 s4, s2
+                        0xBE85_0303, // s_mov_b32 s5, s3
+                        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                        0x7E02_0280, // v_mov_b32 v1, 0
+                        S_ENDPGM,
+                    ],
+                    true,
+                );
+                let s = structure(&p).unwrap();
+                let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+                let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+                assert_eq!(s.masks[&restored] == s.masks[&compare], intact);
+            }
+        });
+    }
+
+    #[test]
     fn a_mask_joined_over_a_back_edge_with_a_rewritten_high_dword_is_not_the_compare() {
         let p = build(
             &[
@@ -1844,5 +2001,60 @@ mod tests {
                 .any(|&e| matches!(s.bools.support(e)[..], [Atom::Lane(_)])),
             "{edges:?}"
         );
+    }
+
+    #[test]
+    fn a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there() {
+        struct Reset(Option<bool>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_SKIP_COMPARE_MASK.set(self.0);
+            }
+        }
+        let _reset = Reset(TEST_SKIP_COMPARE_MASK.replace(Some(false)));
+        // s6 holds -1 (reused data) on the skip edge, and v_cmp_gt_u32 (8 > v0)
+        // inside (v0 < 16). With the switch off, the skip edge keeps TRUE; with
+        // it on, the skip edge is FALSE (0).
+        let mut words = vec![
+            0xBE86_03C1, // s_mov_b32 s6, -1
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBE88_3C6A, // s_and_saveexec_b32 s8, vcc_lo
+            0xBF88_0002, // s_cbranch_execz +2
+            0xD4C4_0006,
+            0x0002_0088, // v_cmp_gt_u32 s6, 8, v0
+            0xBEFE_0308, // s_mov_b32 exec_lo, s8
+            0xD501_0003,
+            0x0019_0280, // v_cndmask_b32 v3, 0, 1, s6
+            S_ENDPGM,
+        ];
+        let p = build(&words, false);
+        let phi = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.phis)
+            .find(|phi| phi.reg == Reg::S(6))
+            .expect("s6 phi");
+        let off = structure(&p).unwrap();
+        assert!(off.phi_masks[&phi.value].contains(&Bool::TRUE), "{:?}", off.phi_masks[&phi.value]);
+
+        TEST_SKIP_COMPARE_MASK.set(Some(true));
+        let on = structure(&p).unwrap();
+        assert_eq!(on.phi_masks[&phi.value].iter().filter(|&&e| e == Bool::FALSE).count(), 1, "{:?}", on.phi_masks[&phi.value]);
+        assert!(!on.phi_masks[&phi.value].contains(&Bool::TRUE));
+
+        // Saved EXEC instead (s_mov_b32 s6, s8) with s6 = 5 on skip edge:
+        // skip edge is NOT forced to Bool::FALSE because s8 holds lanes outside
+        // the branch.
+        words[0] = 0xBE86_0385; // s_mov_b32 s6, 5
+        words[4..6].copy_from_slice(&[0xBE86_0308, 0xBF80_0000]);
+        let p_saved = build(&words, false);
+        let phi_saved = p_saved
+            .blocks
+            .iter()
+            .flat_map(|b| &b.phis)
+            .find(|phi| phi.reg == Reg::S(6))
+            .expect("s6 phi saved");
+        let saved = structure(&p_saved).unwrap();
+        assert!(!saved.phi_masks[&phi_saved.value].contains(&Bool::FALSE), "{:?}", saved.phi_masks[&phi_saved.value]);
     }
 }

@@ -549,6 +549,23 @@ impl Module {
         live
     }
 
+    /// Calls of functions named `name` that [`Module::write`] writes.
+    #[cfg(test)]
+    pub fn written_calls(&self, name: &str) -> usize {
+        let live = self.live();
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.body)
+            .filter(|&&i| live[i as usize])
+            .filter(|&&i| {
+                matches!(
+                    self.insts[i as usize].op,
+                    Op::Call(f, _) if self.funcs[f as usize].name == name
+                )
+            })
+            .count()
+    }
+
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");

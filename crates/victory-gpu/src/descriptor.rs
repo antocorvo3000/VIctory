@@ -884,6 +884,38 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+/// Incremented whenever [`forget`] invalidates at least one view entry,
+/// allowing periodic heap passes to skip liveness scans when nothing was freed.
+static FORGET_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn forget_epoch() -> u64 {
+    FORGET_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Batch liveness check for packed `(generation << 32) | index` view keys.
+pub(crate) fn keys_live(keys: &[u64]) -> Vec<bool> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let views = views_read();
+    keys.iter()
+        .map(|&key| {
+            let i = key as u32;
+            let generation = (key >> 32) as u32;
+            if generation == 0 {
+                return false;
+            }
+            if generation >> KIND_SHIFT != 0 {
+                return true;
+            }
+            views
+                .list
+                .get(i as usize)
+                .is_some_and(|(_, current)| *current == generation)
+        })
+        .collect()
+}
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     #[cfg(windows)]
@@ -895,6 +927,7 @@ pub(crate) fn forget(resource: usize) {
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    let mut invalidated = false;
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -908,6 +941,10 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        invalidated = true;
+    }
+    if invalidated {
+        FORGET_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -1455,6 +1492,62 @@ mod tests {
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scalar_heap_addresses_follow_title_descriptor_creation_copies_and_reuse() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RANGE;
+
+        let Some(_) = crate::host::host() else { return };
+        let null = std::ptr::null();
+        let mut object = null;
+        let desc = HeapDesc { kind: 0, count: 6, flags: 1, nodes: 0 };
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut object), S_OK);
+        let title = heap(object);
+        let gpu = title.host().unwrap();
+        let slot = |index| title.handle(index).unwrap();
+
+        // The null-resource RTAS description captured from the City heap.
+        let mut acceleration = [0, 11, 5768, 0, 1608386816, 13, 0, 0, 0, 0];
+        let tlas = u64::from(acceleration[4]) | u64::from(acceleration[5]) << 32;
+        create_srv(null, null, &acceleration, slot(1));
+        copy_simple(null, 1, slot(2), slot(1), 0);
+
+        // A placed typed buffer with FirstElement = 2 reads eight bytes in.
+        let backing = [0u64; 8];
+        let base = backing.as_ptr() as u64;
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        resource[4] = 64;
+        let mut placed = [0; 16];
+        placed[0] = 41; // R32_FLOAT
+        placed[1] = 1; // BUFFER
+        placed[4] = 2;
+        placed[6] = 4;
+        placed[10] = base as u32;
+        placed[11] = (base >> 32) as u32;
+        create_placed_srv(null, &resource, &placed, slot(3));
+
+        let table = gpu.address_buffer(title).unwrap();
+        let contents = || unsafe {
+            // SAFETY: this read maps the eight u64 words allocated for the six-slot heap.
+            let mut data = std::ptr::null_mut();
+            table.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 64 }), Some(&mut data)).unwrap();
+            let words = data.cast::<[u64; 8]>().read_volatile();
+            table.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+            words
+        };
+        assert_eq!(contents(), [6, 0, 0, tlas, tlas, base + 8, 0, 0]);
+        assert_eq!(&*gpu.acceleration_addresses(), [tlas]);
+        acceleration[4] += 256;
+        create_srv(null, null, &acceleration, slot(1));
+        copy_simple(null, 1, slot(4), slot(3), 0);
+        copy_simple(null, 1, slot(3), slot(0), 0); // untagged, deferred source
+        create_srv(null, null, null.cast(), slot(2));
+        assert_eq!(contents(), [6, 0, 0, tlas + 256, 0, 0, base + 8, 0]);
+        assert_eq!(&*gpu.acceleration_addresses(), [tlas + 256]);
+        assert_eq!(release(object), 0);
     }
 
     /// The title places its shader-visible heap in its own memory

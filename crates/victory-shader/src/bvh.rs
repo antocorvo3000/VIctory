@@ -196,8 +196,14 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool) 
         }
         let enter = near[0].max(near[1]).max(near[2]);
         let leave = far[0].min(far[1]).min(far[2]);
-        // A box whose minimum x is NaN is switched off.
-        if !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
+        // A box whose minimum x is NaN is switched off. Empty builder slots
+        // can also have inverted infinite bounds; their pointers must keep
+        // the miss distance when sorting real hits.
+        if (children[n] != NONE || !crate::emit::ray_shaders())
+            && !b[0].is_nan()
+            && leave >= enter.max(0.0)
+            && enter < ray.extent
+        {
             ids[n] = children[n];
             distances[n] = enter;
         }

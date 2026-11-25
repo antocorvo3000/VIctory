@@ -26,6 +26,31 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// The bits of a [`SLOT_STRIDES`] table dword holding the element stride.
+pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+/// In a [`SLOT_STRIDES`] table dword: a typed buffer view of an integer
+/// format (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
+pub const VIEW_INTEGER: u32 = 1 << 31;
+/// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
+pub const VIEW_SIGNED: u32 = 1 << 30;
+
+/// `VICTORY_D16_INT_VIEWS=0`: treat 16-bit typed buffer accesses (`_d16`)
+/// through integer views as half floats instead of passing bits through.
+pub fn d16_int_views_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_D16_INT_VIEWS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_D16_INT_VIEWS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`d16_int_views_on`], for its thread only.
+    pub(crate) static TEST_D16_INT_VIEWS: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
@@ -47,6 +72,10 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
+/// Root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`] of guest buffer and
+/// acceleration-structure title addresses by view-heap slot (`[count, 0,
+/// slot0, slot1, ...]`). Entry 1 is the null fallback `(0, 0)`.
+pub const SLOT_VIEW_ADDRESSES: u8 = 252;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
@@ -75,6 +104,28 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// parts, each with the groups before it here. Asked for by compute programs
 /// that are told the x number alone (the one-dimensional ones).
 pub const USER_GROUP_BASE: u32 = 0x104;
+/// Actual X thread count of a one-dimensional partial dispatch. Zero
+/// keeps all threads of every dispatched group active. The metadata's
+/// `dword` holds the group's X width, `index` the host binding.
+pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+
+/// `VICTORY_UAV_EVERY_STAGE=0`: do not declare `UAVS_EVERY_STAGE` for
+/// vertex, geometry or mesh programs that declare UAVs.
+fn uav_every_stage_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_UAV_EVERY_STAGE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UAV_EVERY_STAGE").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`uav_every_stage_on`], for its thread only.
+    static TEST_UAV_EVERY_STAGE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -82,6 +133,8 @@ pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// UAVs in a vertex, geometry or mesh program.
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -160,9 +213,17 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Root UAV slots whose emitted operations may modify buffer contents.
+    pub written_root_uavs: Vec<u8>,
+    /// Whether any root UAV was declared globally coherent.
+    pub root_uavs_shared: bool,
+    /// A translated store or atomic can write through the guest page directory.
+    pub writes_guest_memory: bool,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// View-heap index of each typed buffer heap handle, for integer-format lookup.
+    pub view_index: std::collections::HashMap<V, V>,
     /// Resource properties of each heap handle made, in creation order.
     #[cfg(test)]
     pub heap_props: Vec<(u32, u32)>,
@@ -175,6 +236,52 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+}
+
+#[cfg(test)]
+#[test]
+fn only_the_written_root_uavs_need_a_guest_writeback() {
+    let mut s = Shader::new(false);
+    let input = s.root_uav_handle(1);
+    let output = s.root_uav_handle(2);
+    let counter = s.root_uav_handle(3);
+    let (zero, one, mask, align) = (s.m.i32(0), s.m.i32(1), s.m.i8(1), s.m.i32(4));
+    let undef = s.m.undef(s.t.i32);
+    for handle in [input, output] {
+        s.op(
+            s.entry,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            s.t.res_ret,
+            139,
+            &[handle, zero, undef, mask, align],
+        );
+    }
+    s.op(
+        s.entry,
+        "rawBufferStore.i32",
+        Attr::NoUnwind,
+        s.t.void,
+        140,
+        &[output, zero, undef, one, undef, undef, undef, mask, align],
+    );
+    s.op(
+        s.entry,
+        "atomicBinOp.i32",
+        Attr::NoUnwind,
+        s.t.i32,
+        78,
+        &[counter, zero, zero, undef, undef, one],
+    );
+    s.op(
+        s.entry,
+        "atomicCompareExchange.i32",
+        Attr::NoUnwind,
+        s.t.i32,
+        79,
+        &[counter, zero, undef, undef, zero, one],
+    );
+    assert_eq!(s.written_root_uavs, [2, 3]);
 }
 
 impl Shader {
@@ -220,8 +327,12 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            root_uavs_shared: false,
+            writes_guest_memory: false,
             flags: 0,
             nonuniform_handles: 0,
+            view_index: std::collections::HashMap::new(),
             #[cfg(test)]
             heap_props: Vec::new(),
             threads: None,
@@ -255,6 +366,16 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        // Raw root UAVs are also legal inputs. Only a read through a handle
+        // is known to leave it unchanged. Treat any other use of the handle
+        // conservatively, including atomics and future operations.
+        if !matches!(opcode, 68 | 72 | 139) // BufferLoad, GetDimensions, RawBufferLoad
+            && let Some(first) = args.first()
+            && let Some(&(slot, _)) = self.root_uavs.iter().find(|(_, h)| h == first)
+            && !self.written_root_uavs.contains(&slot)
+        {
+            self.written_root_uavs.push(slot);
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -341,7 +462,13 @@ impl Shader {
     /// The handle of the root UAV (a raw buffer) of root parameter `slot`:
     /// `u<slot>` in [`ROOT_CBV_SPACE`].
     pub fn root_uav_handle(&mut self, slot: u8) -> V {
+        self.root_uav_handle_with(slot, false)
+    }
+
+    /// Root UAV handle, marked globally coherent when `shared` is set.
+    pub fn root_uav_handle_with(&mut self, slot: u8, shared: bool) -> V {
         if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
+            self.root_uavs_shared |= shared;
             return h;
         }
         let r = self.m.i32(u32::from(slot));
@@ -357,7 +484,9 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.root_uavs_shared |= shared;
+        let props = if shared { 11 | 0x1000 | 0x4000 } else { 11 | 0x1000 };
+        let h = self.annotate(block, h, props, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
         h
@@ -453,7 +582,11 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let h = self.annotate(block, h, props.0, props.1);
+        if !sampler && props.0 & 0xFF == 10 {
+            self.view_index.insert(h, index);
+        }
+        h
     }
 
     /// The finished container.
@@ -479,6 +612,13 @@ impl Shader {
                     self.flags &= !flag;
                 }
             }
+        }
+        // UAVs outside pixel and compute programs (root UAVs and fault UAVs of
+        // vertex, geometry and mesh programs), as DXC counts them: UAV ranges
+        // declared below, not UAVs indexed from the heap.
+        let compute = self.threads.is_some() && self.mesh.is_none() && self.geometry.is_none();
+        if uav_every_stage_on() && !self.root_uavs.is_empty() && !self.pixel && !compute {
+            self.flags |= flags::UAVS_EVERY_STAGE;
         }
         let mut resources = None;
         let mut bindings = Vec::new();
@@ -583,6 +723,8 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
+                let shared = self.m.bool(self.root_uavs_shared);
+                let shared_md = self.m.md_value(shared);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
@@ -596,7 +738,7 @@ impl Shader {
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
-                        Some(no),
+                        Some(shared_md),
                         Some(no),
                         Some(no),
                         None,
@@ -794,6 +936,9 @@ impl Shader {
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
         }
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
         }
@@ -899,5 +1044,71 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::super::bitcode::Term;
+    use super::*;
+
+    fn uav_atomic(pixel: bool, threads: Option<[u32; 3]>, heap: bool) -> Vec<u8> {
+        let mut s = Shader::new(pixel);
+        s.threads = threads;
+        let b = s.entry;
+        let h = if heap {
+            let index = s.m.i32(0);
+            s.heap_handle(b, index, false, false, (11 | 0x1000, 0))
+        } else {
+            s.root_uav_handle(SLOT_FAULTS)
+        };
+        let (or, zero, one) = (s.m.i32(2), s.m.i32(0), s.m.i32(1));
+        let iu = s.m.undef(s.t.i32);
+        let i32t = s.t.i32;
+        s.op(
+            b,
+            "atomicBinOp.i32",
+            Attr::NoUnwind,
+            i32t,
+            78,
+            &[h, or, zero, iu, iu, one],
+        );
+        s.m.terminate(b, Term::Ret);
+        s.finish()
+    }
+
+    #[test]
+    fn uavs_outside_pixel_and_compute_programs_are_declared() {
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                TEST_UAV_EVERY_STAGE.set(None);
+            }
+        }
+        let _guard = Guard;
+        let mut validator = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+
+        TEST_UAV_EVERY_STAGE.set(Some(false));
+        let mut without = uav_atomic(false, None, false);
+        if let Some(v) = validator.as_mut() {
+            assert!(v.validate(&mut without).is_err());
+        }
+
+        TEST_UAV_EVERY_STAGE.set(Some(true));
+        for (name, pixel, threads, heap) in [
+            ("vertex", false, None, false),
+            ("pixel", true, None, false),
+            ("compute", false, Some([1, 1, 1]), false),
+            ("vertex, heap", false, None, true),
+        ] {
+            let mut dxil = uav_atomic(pixel, threads, heap);
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut dxil)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+        }
     }
 }

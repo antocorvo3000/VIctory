@@ -285,6 +285,27 @@ pub struct Layout {
     xor: u32,
 }
 
+/// A layout's addressing as tables ([`Layout::addressing`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Addressing {
+    /// Rows `pitch` elements apart; the other fields but `slab` unused.
+    pub linear: bool,
+    /// For each axis (x, y, z) and coordinate bit, the address bits inside
+    /// a block it flips.
+    pub flips: [[u32; ADDRESS_BITS]; 3],
+    /// The base swizzle as it lands in a block's offset.
+    pub xor: u32,
+    pub block_log2: u32,
+    /// Block width and height in elements, log2.
+    pub bw_log2: u32,
+    pub bh_log2: u32,
+    /// Depth slices a slice of the layout holds (thick blocks), else 1.
+    pub slab: u32,
+}
+
+/// Coordinate bits the pattern tables cover.
+pub const ADDRESS_BITS: usize = COORD_BITS;
+
 const MAX_MIPS: u32 = 16;
 
 /// The largest width, height and depth (or array size) accepted, in texels.
@@ -635,6 +656,38 @@ impl Layout {
         let bw = self.block[0];
         let x = x + m.tail.map_or(0, |t| t.x);
         (u64::from(x / bw) << self.alignment.trailing_zeros()) | u64::from(flip(&flips[0], x))
+    }
+
+    /// What a GPU program needs to compute the addresses
+    /// [`Layout::offset`] does: the same pattern tables, read by coordinate
+    /// bit, and the block geometry. `None` for the layouts without
+    /// addressing. An element's address is then, with `z` the array or
+    /// depth slice and `m` its mip ([`Layout::mips`]):
+    ///
+    /// - base: `(z / slab) * slice_size + m.offset`;
+    /// - linear: `base + (y * m.pitch + x) * element_bytes`;
+    /// - tiled, with `x += m.tail.x` and `y += m.tail.y`, where
+    ///   `flip(axis, c)` XORs `flips[axis][bit]` for each set bit of `c`:
+    ///
+    /// ```text
+    /// base + (((y >> bh_log2) * (m.pitch >> bw_log2)) << block_log2)
+    ///      + ((((x >> bw_log2) << block_log2) | flip(0, x))
+    ///         ^ flip(1, y) ^ flip(2, z) ^ xor)
+    /// ```
+    pub fn addressing(&self) -> Option<Addressing> {
+        if !self.addressable() {
+            return None;
+        }
+        let log2 = |v: u32| v.trailing_zeros();
+        Some(Addressing {
+            linear: self.flips.is_none(),
+            flips: self.flips.unwrap_or_default(),
+            xor: self.xor,
+            block_log2: self.alignment.trailing_zeros(),
+            bw_log2: log2(self.block[0]),
+            bh_log2: log2(self.block[1]),
+            slab: if self.thick { self.block[2] } else { 1 },
+        })
     }
 
     /// Depth slices a subresource of mip `mip` covers: the mip's depth for
@@ -1177,6 +1230,65 @@ mod tests {
                             }
                         }
                         assert!(back[base + plane - 11..base + plane].iter().all(|&b| b == 0xcc));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The formula `Layout::addressing` documents, as a GPU program runs it
+    /// (32-bit), gives every element the address `Layout::offset` does.
+    #[test]
+    fn addressing_tables_give_the_offsets() {
+        let modes = [0, 1, 2, 5, 6, 9, 10, 17, 18, 21, 22, 24, 25, 26, 27];
+        for mode in modes {
+            let swizzle = Swizzle(mode);
+            for (bpe, block) in [(1, 1), (2, 1), (4, 1), (8, 1), (16, 1), (8, 4), (16, 4)] {
+                let mut cases = vec![
+                    desc(75, 41, 7, bpe, swizzle),
+                    Desc {
+                        depth: 3,
+                        ..desc(33, 66, 4, bpe, swizzle)
+                    },
+                ];
+                if matches!(mode, 0 | 5 | 9 | 17 | 21 | 24..=27) {
+                    cases.push(Desc {
+                        dimension: Dimension::Tex3d,
+                        depth: 11,
+                        ..desc(20, 18, 5, bpe, swizzle)
+                    });
+                }
+                for d in cases {
+                    let d = Desc { block, ..d };
+                    let l = Layout::for_gpu(&d, Pipes::SERIES_X, 0x15b).unwrap();
+                    let a = l.addressing().unwrap();
+                    let flip = |axis: usize, c: u32| {
+                        (0..ADDRESS_BITS)
+                            .filter(|&b| c >> b & 1 != 0)
+                            .fold(0, |acc, b| acc ^ a.flips[axis][b])
+                    };
+                    let n = d.element_bytes;
+                    for mip in 0..d.mips {
+                        let m = l.mips[mip as usize];
+                        let depth = if d.dimension == Dimension::Tex3d { m.depth } else { l.slices };
+                        for z in 0..depth {
+                            for y in 0..m.height {
+                                for x in 0..m.width {
+                                    let base = (z / a.slab) * l.slice_size as u32 + m.offset as u32;
+                                    let got = if a.linear {
+                                        base + (y * m.pitch + x) * n
+                                    } else {
+                                        let (tx, ty) = m.tail.map_or((0, 0), |t| (t.x, t.y));
+                                        let (x, y) = (x + tx, y + ty);
+                                        let row = ((y >> a.bh_log2) * (m.pitch >> a.bw_log2)) << a.block_log2;
+                                        let col = ((x >> a.bw_log2) << a.block_log2) | flip(0, x);
+                                        base + row + (col ^ flip(1, y) ^ flip(2, z) ^ a.xor)
+                                    };
+                                    let want = l.offset(mip, x, y, z).unwrap();
+                                    assert_eq!(u64::from(got), want, "{d:?} mip {mip} ({x},{y},{z})");
+                                }
+                            }
+                        }
                     }
                 }
             }

@@ -1327,6 +1327,16 @@ fn execute_copy_memory(dst: u64, src: u64, len: usize, watch: bool) {
     if len == 0 {
         return;
     }
+    crate::copyback::materialize_range(
+        src as usize,
+        len,
+        crate::copyback::AccessReason::Preparing,
+    );
+    crate::copyback::materialize_range(
+        dst as usize,
+        len,
+        crate::copyback::AccessReason::Preparing,
+    );
     if crate::texture::committed(src as *const u8, len)
         && crate::texture::committed(dst as *const u8, len)
     {
@@ -1360,14 +1370,14 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
     0
 }
 
-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
-/// host has no use for (the ray-tracing builder dispatches this way).
-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
+/// `DispatchX(x, y, z, flags)`: keep the console flags so thread-counted
+/// dispatches can use group sizes and tail-lane masks.
+extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     #[cfg(windows)]
-    state::dispatch(this, x, y, z);
+    state::dispatch_x(this, x, y, z, flags);
     #[cfg(not(windows))]
     {
-        let _ = (this, x, y, z);
+        let _ = (this, x, y, z, flags);
         count_dispatch();
     }
 }
@@ -1648,7 +1658,12 @@ mod state {
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DispatchCall);
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| s.dispatch(list, x, y, z, None));
+    }
+    pub(super) extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
+        let _t = crate::record_timing::Scope::begin(crate::record_timing::Stage::DispatchCall);
+        super::count_dispatch();
+        with_state(this, |list, s| s.dispatch(list, x, y, z, Some(flags)));
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.

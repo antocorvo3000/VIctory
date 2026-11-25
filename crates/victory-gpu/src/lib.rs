@@ -21,6 +21,8 @@ pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
+#[cfg(windows)]
+mod detile;
 pub mod device;
 #[cfg(windows)]
 mod draw;
@@ -31,6 +33,7 @@ pub mod fence;
 pub mod frame;
 #[cfg(windows)]
 mod host;
+mod copyback;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
@@ -61,6 +64,8 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod writeback;
 #[cfg(windows)]
 mod texback;
 

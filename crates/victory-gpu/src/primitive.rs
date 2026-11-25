@@ -18,20 +18,51 @@
 //! direct, indexed and indirect draws alike. This expansion is what is
 //! left for a pipeline that could not get that stage.
 
+/// `VICTORY_RECT_RIGHT_ANGLE=0`: CPU rectangle expansion assumes the right
+/// angle is always at `v1`.
+fn rect_right_angle_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECT_RIGHT_ANGLE").is_none_or(|v| v != "0"))
+}
+
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
-/// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
-/// triangles turn the same way. `elements` are (byte offset, format).
+/// vertices each in `dst`: `(v0, v1, v2)` and `(va, vb, v3)`, so both
+/// triangles turn the same way, with the right angle `vc` picked from the
+/// first float element of two or more components (none: at `v1`), `va` before
+/// it, `vb` after it and `v3 = va + vb - vc`. `elements` are (byte offset, format).
 pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+    if stride == 0 {
+        return;
+    }
+    let right_angle_on = rect_right_angle_on();
     for (rect, out) in src
         .chunks_exact(3 * stride)
         .zip(dst.chunks_exact_mut(6 * stride))
     {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
-        for (slot, i) in [0, 1, 2, 0, 2].into_iter().enumerate() {
+        let right = if right_angle_on {
+            elements
+                .iter()
+                .find_map(|&(offset, format)| {
+                    let at = offset as usize;
+                    let (n, kind) = components(format)?;
+                    let float = matches!(kind, Kind::F32 | Kind::F16);
+                    (float && n >= 2 && stride.saturating_sub(at) / kind.bytes() >= 2).then(|| {
+                        victory_shader::emit::right_angle(
+                            [0, 1, 2].map(|i| [0, 1].map(|k| kind.read(&v(i)[at..], k))),
+                        )
+                    })
+                })
+                .unwrap_or(1)
+        } else {
+            1
+        };
+        let (a, b) = ((right + 2) % 3, (right + 1) % 3);
+        for (slot, i) in [0, 1, 2, a, b].into_iter().enumerate() {
             out[slot * stride..(slot + 1) * stride].copy_from_slice(v(i));
         }
         let fourth = &mut out[5 * stride..];
-        fourth.copy_from_slice(v(0));
+        fourth.copy_from_slice(v(a));
         for &(offset, format) in elements {
             let at = offset as usize;
             let Some((n, kind)) = components(format) else {
@@ -42,7 +73,7 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
             let inside = stride.saturating_sub(at) / kind.bytes();
             for c in 0..n.min(inside) {
                 let get = |i: usize| kind.read(&v(i)[at..], c);
-                let value = get(0) + get(2) - get(1);
+                let value = get(a) + get(b) - get(right);
                 kind.write(&mut fourth[at..], c, value);
             }
         }
@@ -223,6 +254,32 @@ mod tests {
         expand_rects(&src, &mut dst, 8, &[(0, 16), (4, 2), (8, 28)]);
         assert_eq!(dst[..40], [&src[..], &src[..8], &src[16..]].concat()[..]);
         assert_eq!(dst[40..], vertex(4.0, 6.0)[..]);
+    }
+
+    /// Top left, bottom left, top right (right angle first) completes at the
+    /// bottom right with second triangle `(v2, v1, v3)`; any triangle keeps
+    /// the same winding in both halves.
+    #[test]
+    fn rectangles_complete_opposite_their_right_angle() {
+        let vertex = |x: f32, y: f32| [x.to_le_bytes(), y.to_le_bytes()].concat();
+        let src = [vertex(0.0, 0.0), vertex(0.0, 1.0), vertex(1.0, 0.0)].concat();
+        let mut dst = vec![0u8; 6 * 8];
+        expand_rects(&src, &mut dst, 8, &[(0, 16)]);
+        assert_eq!(
+            dst[24..],
+            [&src[16..24], &src[8..16], &vertex(1.0, 1.0)[..]].concat()[..]
+        );
+        let read = |d: &[u8], i: usize| {
+            let f = |k: usize| f32::from_le_bytes(d[i * 8 + k * 4..i * 8 + k * 4 + 4].try_into().unwrap());
+            [f(0), f(1)]
+        };
+        let turn = |d: &[u8], i: usize| {
+            let [a, b, c] = [i, i + 1, i + 2].map(|k| read(d, k));
+            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        };
+        let src = [vertex(0.0, 0.0), vertex(3.0, 1.0), vertex(1.0, 0.0)].concat();
+        expand_rects(&src, &mut dst, 8, &[(0, 16)]);
+        assert!(turn(&dst, 0) * turn(&dst, 3) > 0.0, "same winding");
     }
 
     /// `half_to_f32` reads subnormals, so an f16 rectangle output must be
