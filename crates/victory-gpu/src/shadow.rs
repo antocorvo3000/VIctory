@@ -16,7 +16,7 @@
 //! themselves, every buffer range the heap's views reach
 //! (`crate::bindless`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -48,7 +48,7 @@ pub(crate) struct Shadow {
 type Segments = Vec<(usize, Vec<u8>)>;
 
 /// A snapshot and the pieces already compared.
-type Snapshot = (Segments, std::collections::HashSet<usize>);
+type Snapshot = (Segments, HashSet<usize>);
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
@@ -194,6 +194,70 @@ fn snapshot_piece<'a>(
         }
     }
     scratch
+}
+
+/// Start parallel scans at 32 MiB of unchecked full pages.
+const PAGES_PER_WORKER: usize = (16 << 20) / PAGE;
+
+/// `VICTORY_PARALLEL_COPY_BACK=0` compares every page on the submit thread.
+fn copy_back_workers() -> usize {
+    static WORKERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        if std::env::var("VICTORY_PARALLEL_COPY_BACK").is_ok_and(|v| v.trim() == "0") {
+            1
+        } else {
+            std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).clamp(1, 4))
+        }
+    })
+}
+
+/// Known full pages in copy order, with whether their snapshot differs.
+type PageChanges = Vec<(usize, bool)>;
+
+fn scan_pages(
+    data: &[u8],
+    from: usize,
+    before: &[(usize, Vec<u8>)],
+    pages: &mut [(usize, bool)],
+    workers: usize,
+) {
+    let scan = |batch: &mut [(usize, bool)]| {
+        let mut segment = before;
+        let mut scratch = Vec::new();
+        for (at, changed) in batch {
+            while segment[0].0 + segment[0].1.len() <= *at {
+                segment = &segment[1..];
+            }
+            let host = &data[*at - from..*at - from + PAGE];
+            *changed = host != snapshot_piece(segment, *at, PAGE, &mut scratch);
+        }
+    };
+    if pages.is_empty() {
+        return;
+    }
+    let workers = workers.min((pages.len() / PAGES_PER_WORKER).max(1));
+    if workers == 1 {
+        scan(pages);
+        return;
+    }
+    let chunk = pages.len().div_ceil(workers);
+    let started = std::thread::scope(|scope| {
+        let mut batches = pages.chunks_mut(chunk);
+        let first = batches.next().expect("pages are nonempty");
+        let mut started = true;
+        for batch in batches {
+            let task = std::thread::Builder::new().spawn_scoped(scope, || scan(batch));
+            if task.is_err() {
+                started = false;
+                break;
+            }
+        }
+        scan(first);
+        started
+    });
+    if !started {
+        scan(pages);
+    }
 }
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
@@ -407,9 +471,10 @@ impl Shadow {
         {
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CompareUs);
-            // By 64 KiB piece: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
-            const PIECE: usize = 64 << 10;
+            let scanned = self.scan_copy_back(from, to, before, compared);
+            let mut scanned = scanned.map(Vec::into_iter);
+            // By page: title memory is read only where the copy differs
+            // from its snapshot. Read and write those pages in order.
             let mut old_piece = Vec::new();
             let mut title = Vec::new();
             let mut runs = Vec::new();
@@ -418,24 +483,36 @@ impl Shadow {
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                let n = (PAGE - (start + at) % PAGE).min(to - at);
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
                 // went back.
-                if n == PIECE && !compared.insert(start + at) {
+                if n == PAGE && !compared.insert(start + at) {
                     at += n;
                     continue;
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
+                let mut known_changed = false;
+                if n == PAGE
+                    && let Some(scan) = &mut scanned
+                {
+                    let (page, changed) = scan.next().expect("matches the unchecked pages");
+                    debug_assert_eq!(page, at);
+                    if !changed {
+                        at += n;
+                        continue;
+                    }
+                    known_changed = true;
                 }
                 while before[0].0 + before[0].1.len() <= at {
                     before = &before[1..];
                 }
                 let old = snapshot_piece(before, at, n, &mut old_piece);
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old {
+                // SAFETY: inside the mapping; the parallel scan has joined
+                // and only this thread writes the copy.
+                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                if known_changed || host != old {
                     if title.len() < n {
                         title.resize(n, 0);
                     }
@@ -468,6 +545,35 @@ impl Shadow {
             }
         }
         written
+    }
+
+    fn scan_copy_back(
+        &self,
+        from: usize,
+        to: usize,
+        before: &[(usize, Vec<u8>)],
+        compared: &HashSet<usize>,
+    ) -> Option<PageChanges> {
+        let workers = copy_back_workers();
+        let start = self.start as usize;
+        let first = (start + from).next_multiple_of(PAGE);
+        let end = (start + to) / PAGE * PAGE;
+        if workers <= 1 || end.saturating_sub(first) / PAGE < 2 * PAGES_PER_WORKER {
+            return None;
+        }
+        let mut pages: PageChanges = (first..end)
+            .step_by(PAGE)
+            .filter(|at| !compared.contains(at))
+            .map(|at| (at - start, false))
+            .collect();
+        if pages.len() < 2 * PAGES_PER_WORKER {
+            return None;
+        }
+        // SAFETY: the whole range is in the mapping and the GPU is done.
+        // Workers only read, and join before this thread changes any bytes.
+        let host = unsafe { std::slice::from_raw_parts(self.data.add(from), to - from) };
+        scan_pages(host, from, before, &mut pages, workers);
+        Some(pages)
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -905,6 +1011,96 @@ mod tests {
             let name = ["coalesced", "incremental"][mode];
             let elapsed = samples[samples.len() / 2].as_secs_f64() * 1000.0;
             println!("{name}: {} MiB copied, {elapsed:.2} ms median", totals[mode] / MIB);
+        }
+    }
+
+    #[test]
+    fn parallel_copy_back_scan_matches_serial_on_selected_pages() {
+        let pages = 2 * PAGES_PER_WORKER + 3;
+        let len = pages * PAGE;
+        let mut host = vec![0xc3; len];
+        let boundary = 17 * PAGE + 5;
+        let before = [
+            (0, host[..boundary].to_vec()),
+            (boundary, host[boundary..].to_vec()),
+        ];
+        let changed = [0, 17, pages - 1];
+        for i in changed {
+            host[i * PAGE + 7] ^= 1;
+        }
+        let mut parallel: PageChanges = (0..pages).filter(|&p| p != 1).map(|p| (p * PAGE, false)).collect();
+        let mut serial = parallel.clone();
+        scan_pages(&host, 0, &before, &mut parallel, 4);
+        scan_pages(&host, 0, &before, &mut serial, 1);
+        assert_eq!(parallel, serial);
+        assert_eq!(
+            parallel.iter().filter_map(|&(at, different)| different.then_some(at / PAGE)).collect::<Vec<_>>(),
+            changed
+        );
+    }
+
+    #[test]
+    fn large_copy_back_preserves_title_bytes_and_skips_compared_pages() {
+        let len = (2 * PAGES_PER_WORKER + 4) * PAGE;
+        let title = title_memory(len);
+        let start = title.as_mut_ptr() as usize;
+        register(start, start as u64, len as u64);
+        let Some(copy) = find(start as u64, len as u64) else {
+            unregister(start, start as u64);
+            return;
+        };
+        copy.update(start, len);
+        let boundary = 17 * PAGE + 123;
+        copy.writing(start + 16, boundary - 16);
+        copy.writing(start + boundary, len - boundary - 16);
+        copy.writing(start + 8, len - 16);
+        copy.writing(start + 8 * PAGE, PAGE);
+
+        for (at, value) in [(9, 1), (8 * PAGE + 9, 2), (boundary + 1, 3), (len - 10, 4)] {
+            copy.write_host((start + at) as u64, &[value]);
+        }
+        title[boundary] = 0xc3;
+        assert_eq!(copy.copy_back(start + 8 * PAGE, PAGE), 1);
+        assert_eq!(copy.copy_back(start + 8, len - 16), 3);
+        assert_eq!(
+            [title[9], title[8 * PAGE + 9], title[boundary], title[boundary + 1], title[len - 10]],
+            [1, 2, 0xc3, 3, 4]
+        );
+        copy.keep_writes(start + 16, boundary - 16);
+        copy.keep_writes(start + boundary, len - boundary - 16);
+        unregister(start, start as u64);
+    }
+
+    #[test]
+    #[ignore = "offline performance benchmark"]
+    fn copy_back_scan_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for mib in [32, 160] {
+            let len = mib << 20;
+            let mut host = vec![0x5a; len];
+            let before = [(0, host.clone())];
+            for i in (7..len / PAGE).step_by(83) {
+                host[i * PAGE + 9] ^= 1;
+            }
+            let mut times = [Vec::new(), Vec::new()];
+            for sample in 0..10 {
+                for mode in [sample % 2, 1 - sample % 2] {
+                    let mut pages: PageChanges = (0..len).step_by(PAGE).map(|at| (at, false)).collect();
+                    let start = Instant::now();
+                    scan_pages(black_box(&host), 0, black_box(&before), &mut pages, [1, 4][mode]);
+                    black_box(pages);
+                    if sample > 0 {
+                        times[mode].push(start.elapsed());
+                    }
+                }
+            }
+            for samples in &mut times {
+                samples.sort_unstable();
+            }
+            let medians = times.map(|s| s[s.len() / 2].as_secs_f64() * 1000.0);
+            println!("{mib} MiB: {:.2} ms serial, {:.2} ms parallel", medians[0], medians[1]);
         }
     }
 
