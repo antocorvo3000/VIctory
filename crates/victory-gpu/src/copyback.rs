@@ -111,7 +111,7 @@ pub(crate) fn keep_copied_enabled() -> bool {
         return v;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| env_flag("VICTORY_COPYBACK_KEEP_COPIED"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPYBACK_KEEP_COPIED").is_none_or(|v| v != "0"))
 }
 
 /// Fast-path atomic counters so disabled / idle frames pay one relaxed load.

@@ -5,14 +5,14 @@ code runs natively, the layer provides the console's services and translates its
 for Direct3D 12. **You need your own legally obtained copy of the game**, already readable on disk. Nothing here
 decrypts anything or works around any protection, and no game files are included or shared.
 
-## Status (25 Nov 2026, tested on my AMD Radeon RX 6800 XT, i7-12700K, 32 GB, Windows 11)
+## Status (26 Nov 2026, tested on my AMD Radeon RX 6800 XT, i7-12700K, 32 GB, Windows 11)
 
 | | Result |
 |---|---|
 | Boot, intro video, start screen, menus | work |
 | Loading into the world | works, no failed DirectStorage reads |
 | The world (prologue) | drawn and lit; characters and hair complete; **picture almost complete once loaded**; cutscenes load much more |
-| Speed in the world | **4.3-5 fps** (about 230 ms a frame, the card ~70% busy), Series X mode, no upscaling |
+| Speed in the world | **4.5-5 fps** with the full scene (about 5,000-6,000 draws a frame), peaks of 6-7, Series X mode, no upscaling |
 | Stability | 17 min in the world without a crash or device removal |
 | Memory | about 28 GB committed |
 
@@ -41,8 +41,17 @@ constant ambient light stands in for it; textures can still pop in late.
   names; wave64 mesh shaders exchange first-lane reads across their two 32-lane halves (web triangles and deformed
   faces); read-only raw views off 16-byte alignment get their own copy (writable ones stay on the shared copy); heap
   buffer reads wait for the UAV writes before them (skinned characters). `VICTORY_<NAME>=0` turns each off.
-- **Off by default** (no gain measured, one of them dims reflected light): 4 KiB copy diffs (`VICTORY_COPY_DIFF`),
-  the wide heap pass (`VICTORY_HEAP_PASS_WIDE`), draw state and table caches (`VICTORY_DRAW_STATE_CACHE`,
+- **Copies of title memory to the card (on):** refreshes of host copies run on several threads
+  (`VICTORY_WIDE_REFRESH`), the write-watch journal is read under a shared lock and guarded views are answered
+  outside it; only the 4 KiB blocks that changed are sent (`VICTORY_COPY_DIFF`); what the card wrote and was
+  copied back is not sent up again unchanged (`VICTORY_COPYBACK_KEEP_COPIED`). Copies went from about 85 to 48 ms
+  a frame and from 180 to 70 MB.
+- **Textures (on):** title-filled textures get memory only for the mip levels that are mapped
+  (`VICTORY_RESIDENT_LEVELS`), and may use 95% of the card's budget (`VICTORY_TEXTURE_ROOM_PERCENT`): the card no
+  longer fills up and textures arrive sooner.
+- **Shaders:** the translator's optimizer is on again (it no longer drops geometry): GPU time about 110 to 90 ms a
+  frame with the same scene.
+- **Off by default** (no gain measured, one of them dims reflected light): the wide heap pass (`VICTORY_HEAP_PASS_WIDE`), draw state and table caches (`VICTORY_DRAW_STATE_CACHE`,
   `VICTORY_TABLE_CACHE`); timings with `VICTORY_RECORD_TIMING=1`.
 - **Recording the title's commands in parallel (on):** the descriptor heap's made/kept slots are sharded and read
   without locks, the heap buffer view pass is incremental and sharded, made descriptor tables are found again by
@@ -81,10 +90,9 @@ Requirements: Windows 10/11 x64, an AVX2 CPU, a Direct3D 12 GPU with shader mode
 cargo build --release -p victory
 ```
 
-Pre-build the shaders and pipelines once (about 10 minutes):
+Pre-build the shaders and pipelines once (about 12 minutes):
 
 ```powershell
-$env:VICTORY_SHADER_OPT = '0'
 $env:VICTORY_SKIP_PIPELINES = (Get-Content docs\skip-amd.txt -Raw).Trim()
 target\release\victory.exe translate --cache --pipelines --jobs 8 <game dir>\shaders.rpf
 ```
@@ -92,7 +100,6 @@ target\release\victory.exe translate --cache --pipelines --jobs 8 <game dir>\sha
 Play (the settings I test with):
 
 ```powershell
-$env:VICTORY_SHADER_OPT = '0'
 $env:VICTORY_SKIP_PIPELINES = (Get-Content docs\skip-amd.txt -Raw).Trim()
 $env:VICTORY_LATE_WAIT = '1'
 $env:VICTORY_WIDE_BACK = '1'

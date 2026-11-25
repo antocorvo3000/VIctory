@@ -850,6 +850,31 @@ fn unlike(dst: This, src: This) -> bool {
     unlike
 }
 
+#[cfg(windows)]
+fn translate_texture_subresource(
+    resource: This,
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    title_sub: u32,
+) -> Option<u32> {
+    if !crate::levels::on() {
+        return Some(title_sub);
+    }
+    let first = crate::resource::host_first_level(resource);
+    if first == 0 {
+        return Some(title_sub);
+    }
+    // SAFETY: a live texture resource.
+    let d = unsafe { texture.GetDesc() };
+    let slices = if d.Dimension
+        == windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D
+    {
+        1
+    } else {
+        u32::from(d.DepthOrArraySize).max(1)
+    };
+    crate::levels::map_subresource(title_sub, first, u32::from(d.MipLevels) + first, slices)
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -879,8 +904,57 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
-            // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(to, from) };
+            let (dst_first, src_first) = if crate::levels::on() {
+                (
+                    crate::resource::host_first_level(dst),
+                    crate::resource::host_first_level(src),
+                )
+            } else {
+                (0, 0)
+            };
+            if dst_first == 0 && src_first == 0 {
+                // SAFETY: an open list and live textures.
+                unsafe { list.list.CopyResource(to, from) };
+            } else {
+                use windows::Win32::Graphics::Direct3D12::*;
+                // SAFETY: live textures.
+                let (a, b) = unsafe { (to.GetDesc(), from.GetDesc()) };
+                let dst_title_mips = u32::from(a.MipLevels) + dst_first;
+                let src_title_mips = u32::from(b.MipLevels) + src_first;
+                if dst_title_mips == src_title_mips && a.Dimension == b.Dimension {
+                    let slices = if a.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                        1
+                    } else {
+                        u32::from(a.DepthOrArraySize).min(u32::from(b.DepthOrArraySize))
+                    };
+                    let planes = if matches!(a.Format.0, 19 | 20 | 44 | 45) { 2 } else { 1 };
+                    let sub_loc = |res: &ID3D12Resource, sub: u32| D3D12_TEXTURE_COPY_LOCATION {
+                        // SAFETY: a borrowed pointer the location never releases.
+                        pResource: unsafe { std::mem::transmute_copy(res) },
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub },
+                    };
+                    for (dst_sub, src_sub) in crate::levels::copy_resource_subresources(
+                        dst_first,
+                        src_first,
+                        dst_title_mips,
+                        slices,
+                        planes,
+                    ) {
+                        // SAFETY: an open list and live textures; subresources match in size.
+                        unsafe {
+                            list.list.CopyTextureRegion(
+                                &sub_loc(to, dst_sub),
+                                0,
+                                0,
+                                0,
+                                &sub_loc(from, src_sub),
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -968,6 +1042,15 @@ extern "system" fn copy_texture_region(
         if unlike(dst.resource, src.resource) {
             return;
         }
+        let mut to_location = dst;
+        if dst.kind != FOOTPRINT {
+            let Some(host_sub) =
+                translate_texture_subresource(dst.resource, to, dst.footprint.offset as u32)
+            else {
+                return;
+            };
+            to_location.footprint.offset = u64::from(host_sub);
+        }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
@@ -997,12 +1080,18 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            let Some(host_sub) =
+                translate_texture_subresource(src.resource, texture, src.footprint.offset as u32)
+            else {
+                return;
+            };
             list.twin_use(src.resource, false, false);
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
+            from.footprint.offset = u64::from(host_sub);
         }
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
@@ -1011,10 +1100,9 @@ extern "system" fn copy_texture_region(
         // of this list (`crate::tiles`): the title's bake copies each level
         // of its result into a block-compressed texture of that kind, and
         // a copy into a level without memory is dropped.
-        crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
+        crate::texture::card_writes(list, dst.resource, to, Some(to_location.footprint.offset as u32));
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
-        let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
@@ -1090,6 +1178,8 @@ fn read_back(
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     let texture = crate::resource::host_resource(src.resource).ok_or("no host texture")?;
+    let host_sub = translate_texture_subresource(src.resource, texture, src.footprint.offset as u32)
+        .ok_or("subresource not resident")?;
     let (buffer, cap) = host.take_read_back(size).ok_or("no read-back buffer")?;
     // As a texture source of any copy: what shaders wrote to a depth twin
     // and what the title wrote itself first, then the state.
@@ -1100,6 +1190,7 @@ fn read_back(
     ensure_state(list, src.resource, COPY_SOURCE);
     let mut from = src;
     from.resource = texture.as_raw().cast_const().cast();
+    from.footprint.offset = u64::from(host_sub);
     let mut to = dst;
     to.resource = buffer.as_raw().cast_const().cast();
     to.footprint = footprint;
@@ -1162,6 +1253,12 @@ extern "system" fn resolve(
         if unlike(dst, src) {
             return;
         }
+        let Some(dst_sub) = translate_texture_subresource(dst, to, dst_sub) else {
+            return;
+        };
+        let Some(src_sub) = translate_texture_subresource(src, from, src_sub) else {
+            return;
+        };
         // Depth textures shaders also write: what they wrote, first.
         list.twin_use(dst, false, true);
         list.twin_use(src, false, false);

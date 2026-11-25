@@ -85,13 +85,13 @@ pub(crate) struct HeapDesc {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResourceDesc {
-    dimension: u32,
+    pub(crate) dimension: u32,
     alignment: u64,
-    width: u64,
-    height: u32,
-    depth_or_array_size: u16,
-    mip_levels: u16,
-    format: u32,
+    pub(crate) width: u64,
+    pub(crate) height: u32,
+    pub(crate) depth_or_array_size: u16,
+    pub(crate) mip_levels: u16,
+    pub(crate) format: u32,
     sample_count: u32,
     sample_quality: u32,
     layout: u32,
@@ -1196,6 +1196,9 @@ pub(crate) struct HostTexture {
     evicted: std::sync::atomic::AtomicBool,
     /// Frame when [`Self::evicted`] turned true.
     evicted_frame: std::sync::atomic::AtomicU64,
+    /// For `VICTORY_RESIDENT_LEVELS=1`: the title mip level that corresponds
+    /// to host mip `0` (`0` when the host copy holds the full chain).
+    pub(crate) first_level: u32,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1258,6 +1261,12 @@ struct Hosted {
     gone: std::sync::atomic::AtomicBool,
     /// A texture of [`PLACED_TEXTURES`].
     placed: std::sync::atomic::AtomicBool,
+    /// ID of the current `HostTexture` in `made` (`0` when none).
+    current_id: std::sync::atomic::AtomicU64,
+    /// True when `VICTORY_RESIDENT_LEVELS=1` withheld or trimmed levels.
+    trimmed: std::sync::atomic::AtomicBool,
+    /// Last `descriptor::host::remap_epoch()` checked for resident levels.
+    checked_epoch: std::sync::atomic::AtomicU64,
 }
 
 /// Counts for the memory line: host copies of textures the title fills
@@ -1420,6 +1429,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             }
             LRU_STATS[1].fetch_add(1, Relaxed);
         } else if let Some((old_host, twin)) = made.take() {
+            r.host.current_id.store(0, Relaxed);
             crate::texture::unstage(this);
             crate::host::retire(old_host);
             if let Some(twin) = twin {
@@ -1436,6 +1446,30 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
+        // Resident levels (`VICTORY_RESIDENT_LEVELS=1`): when enabled, a texture
+        // the title fills gets a host copy holding only the contiguous suffix of
+        // mip levels whose title memory is mapped. Returns `None` without
+        // setting `refused` if no level is mapped yet.
+        let mut resident_first = 0u32;
+        let mut trimmed_desc_storage = None;
+        if let Some(first_opt) = resident_first_for(this, r) {
+            r.host
+                .checked_epoch
+                .store(crate::descriptor::host::remap_epoch(), Relaxed);
+            let Some(first) = first_opt else {
+                r.host.trimmed.store(true, Relaxed);
+                return None;
+            };
+            resident_first = first;
+            r.host.trimmed.store(first > 0, Relaxed);
+            if first > 0 {
+                trimmed_desc_storage = Some(crate::levels::trimmed_desc(
+                    &r.desc,
+                    first,
+                    mip_count(&r.desc),
+                ));
+            }
+        }
         // Levels on demand (`crate::tiles`): a texture the title places in
         // memory and fills, of a megabyte or more, that does not hold all
         // its levels now, is made without memory and given it level by
@@ -1451,7 +1485,12 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        if trimmed_desc_storage.is_none()
+            && !crate::levels::on()
+            && shape_fits
+            && r.host.placed.load(Relaxed)
+            && crate::tiles::wanted()
+        {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: an uploadable console layout
@@ -1474,9 +1513,10 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 texture = reserved;
             }
         }
+        let create_desc = trimmed_desc_storage.as_ref().unwrap_or(&r.desc);
         let texture = match texture {
             Some(texture) => Some(texture),
-            None => host_texture(&r.desc, r.host.state, clear, r.data() as usize),
+            None => host_texture(create_desc, r.host.state, clear, r.data() as usize),
         };
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
@@ -1499,16 +1539,23 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
             None => HostTexture::new(texture, state),
         };
+        host.first_level = resident_first;
         host.filled = fills(&r.desc);
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
             KINDS[1].fetch_add(host.bytes, Relaxed);
+        }
+        if resident_first > 0 {
+            let full = footprint(&r.desc).map_or(host.bytes, |f| f.size);
+            crate::levels::STATS[0].fetch_add(1, Relaxed);
+            crate::levels::STATS[1].fetch_add(full.saturating_sub(host.bytes), Relaxed);
         }
         if r.host.gone.load(Relaxed) {
             KINDS[4].fetch_add(1, Relaxed);
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
+        r.host.current_id.store(host.id, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
@@ -1639,7 +1686,7 @@ fn room_percent() -> u64 {
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map_or(95, |percent| percent.clamp(50, 97))
     })
 }
 
@@ -1716,7 +1763,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
     let began = std::time::Instant::now();
     // (The last: made level by level, its bytes are those of its tiles.)
-    let mut copies: Vec<(usize, ResourceDesc, u64, bool)> = Vec::new();
+    let mut copies: Vec<(usize, ResourceDesc, u64, bool, u32)> = Vec::new();
     // Textures the title fills without a host copy: never one, one let go.
     let mut without = [0u64; 2];
     {
@@ -1730,8 +1777,8 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
             let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             match made.as_ref() {
                 Some((host, _)) => copies.push(match &host.tiled {
-                    Some(tiled) => (r.data() as usize, r.desc, tiled.given_bytes(), true),
-                    None => (r.data() as usize, r.desc, host.bytes, false),
+                    Some(tiled) => (r.data() as usize, r.desc, tiled.given_bytes(), true, 0),
+                    None => (r.data() as usize, r.desc, host.bytes, false, host.first_level),
                 }),
                 None => without[usize::from(r.host.gone.load(Relaxed))] += 1,
             }
@@ -1755,7 +1802,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
         let mut c = [0u64; 7];
         // Of the copies: made level by level, and the bytes of their tiles.
         let mut on_demand = [0u64; 2];
-        for &(memory, desc, bytes, by_level) in &copies {
+        for &(memory, desc, bytes, by_level, first_level) in &copies {
             c[0] += 1;
             c[1] += bytes;
             if by_level {
@@ -1767,7 +1814,11 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
                 c[6] += 1;
                 continue;
             };
-            if layout.size == 0 || crate::texture::committed(memory as *const u8, layout.size as usize) {
+            let check_size = crate::levels::resident_tiled_size(&layout, first_level);
+            if layout.size == 0 || (layout.slices == 1 && crate::texture::committed(memory as *const u8, check_size as usize)) {
+                continue;
+            }
+            if first_level == 0 && crate::texture::committed(memory as *const u8, layout.size as usize) {
                 continue;
             }
             c[3] += 1;
@@ -1775,6 +1826,7 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
             // its first block, the others after it from the smallest up
             // (`victory_formats::texture::Layout`).
             let mips = &layout.mips;
+            let first = (first_level as usize).min(mips.len());
             let tail = (layout.first_tail_mip as usize).min(mips.len());
             let there = |from: u64, to: u64| {
                 (0..u64::from(layout.slices)).all(|slice| {
@@ -1782,9 +1834,9 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
                     crate::texture::committed(at as *const u8, (to - from) as usize)
                 })
             };
-            let all: u64 = mips.iter().map(texels).sum::<u64>().max(1);
+            let all: u64 = mips[first..].iter().map(texels).sum::<u64>().max(1);
             let (mut missing, mut any) = (0u64, false);
-            for (level, m) in mips.iter().enumerate().take(tail) {
+            for (level, m) in mips.iter().enumerate().take(tail).skip(first) {
                 let end = if level == 0 { layout.slice_size } else { mips[level - 1].offset };
                 if end <= m.offset {
                     continue;
@@ -1796,11 +1848,11 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
                     c[4] += u64::from(level == 0);
                 }
             }
-            if tail < mips.len() {
+            if first <= tail && tail < mips.len() {
                 if there(0, layout.alignment.min(layout.slice_size).max(1)) {
                     any = true;
                 } else {
-                    missing += mips[tail..].iter().map(texels).sum::<u64>();
+                    missing += mips[tail.max(first)..].iter().map(texels).sum::<u64>();
                 }
             }
             c[2] += (u128::from(bytes) * u128::from(missing) / u128::from(all)) as u64;
@@ -2044,6 +2096,7 @@ pub(crate) fn let_go_idle() {
                         && crate::host::references(&host.texture) == 1
                 });
                 if idle {
+                    r.host.current_id.store(0, Relaxed);
                     crate::texture::unstage(at as This);
                     made.take()
                 } else {
@@ -2190,10 +2243,12 @@ pub(crate) fn let_go_idle() {
                     }
                     None
                 } else {
+                    r.host.current_id.store(0, Relaxed);
                     crate::texture::unstage(cand.at as This);
                     made.take()
                 }
             } else {
+                r.host.current_id.store(0, Relaxed);
                 crate::texture::unstage(cand.at as This);
                 made.take()
             }
@@ -2378,6 +2433,194 @@ pub(crate) fn host_id(this: This) -> Option<u64> {
     made.as_ref().map(|(h, _)| h.id)
 }
 
+/// Title mip level mapped to host mip `0` of `this`'s current host copy (`0`
+/// when full chain or no host copy exists). Does not create a host copy.
+#[cfg(windows)]
+pub(crate) fn host_first_level(this: This) -> u32 {
+    if this.is_null() || !crate::levels::on() {
+        return 0;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return 0;
+    }
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    made.as_ref().map_or(0, |(h, _)| h.first_level)
+}
+
+/// Whether `this` is eligible for `VICTORY_RESIDENT_LEVELS=1` and currently has
+/// no resident levels mapped (and is not refused).
+#[cfg(windows)]
+pub(crate) fn has_no_resident_levels(this: This) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() || !crate::levels::on() {
+        return false;
+    }
+    let r = resource(this);
+    r.desc.dimension != BUFFER
+        && !r.host.refused.load(Relaxed)
+        && r.host.trimmed.load(Relaxed)
+        && r.host.current_id.load(Relaxed) == 0
+}
+
+/// Lock-free check whether `this` has trimmed/withheld levels and a remap or
+/// page write occurred since it was last checked.
+#[cfg(windows)]
+pub(crate) fn needs_resident_sync(this: This) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() || !crate::levels::on() {
+        return false;
+    }
+    let r = resource(this);
+    r.host.trimmed.load(Relaxed)
+        && r.host.checked_epoch.load(Relaxed) != crate::descriptor::host::remap_epoch()
+}
+
+/// Lock-free check whether `host_id` is still `this`'s current host copy.
+#[cfg(windows)]
+pub(crate) fn is_host_current(this: This, host_id: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    !this.is_null() && resource(this).host.current_id.load(Relaxed) == host_id
+}
+
+/// If `this` qualifies for `VICTORY_RESIDENT_LEVELS=1`, returns
+/// `Some(resident_first_level(...))`; returns `None` if `VICTORY_RESIDENT_LEVELS`
+/// is off or the texture is not eligible for resident-level trimming.
+#[cfg(windows)]
+fn resident_first_for(this: This, r: &Resource) -> Option<Option<u32>> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !crate::levels::on()
+        || r.desc.dimension == BUFFER
+        || !fills(&r.desc)
+        || r.desc.sample_count > 1
+        || mip_count(&r.desc) <= 1
+        || crate::texture::host_wrote(this as usize)
+        || alias_of(this).is_some()
+    {
+        return None;
+    }
+    let layout = texture_layout(&r.desc)?.planes.into_iter().next()?.layout;
+    if !crate::texture::uploadable(&layout) {
+        return None;
+    }
+    let start = r.data() as u64;
+    let limit = if r.host.placed.load(Relaxed) {
+        crate::descriptor::host::next_start(start, start.saturating_add(layout.size))
+            .map_or(u64::MAX, |at| at.saturating_sub(start))
+    } else {
+        u64::MAX
+    };
+    Some(crate::levels::resident_first_level(
+        &layout,
+        r.data().cast_const(),
+        limit,
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) enum ResidentSync {
+    Unchanged,
+    Swapped {
+        new_host: std::sync::Arc<HostTexture>,
+        old_host: std::sync::Arc<HostTexture>,
+        old_raw: usize,
+    },
+    Dropped {
+        old_host: std::sync::Arc<HostTexture>,
+        old_raw: usize,
+    },
+    DeferredGrowth,
+}
+
+/// Checks whether title texture `this`'s mapped mip levels changed under
+/// `VICTORY_RESIDENT_LEVELS=1`, and swaps its host copy if needed (caller must
+/// upload `new_host`, swap persistent descriptor slots viewing `old_raw`, and
+/// retire `old_host`). Must not be called while holding any `HostHeap` lock.
+#[cfg(windows)]
+pub(crate) fn sync_resident_levels(this: This, allow_grow: bool) -> ResidentSync {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+    if this.is_null() || !crate::levels::on() {
+        return ResidentSync::Unchanged;
+    }
+    let r = resource(this);
+    let Some(new_first_opt) = resident_first_for(this, r) else {
+        return ResidentSync::Unchanged;
+    };
+    let epoch = crate::descriptor::host::remap_epoch();
+    let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((old_host, _)) = made.as_ref() else {
+        r.host.checked_epoch.store(epoch, Relaxed);
+        return ResidentSync::Unchanged;
+    };
+    if old_host.tiled.is_some() {
+        return ResidentSync::Unchanged;
+    }
+    let old_first = old_host.first_level;
+    let Some(new_first) = new_first_opt else {
+        let (old_host, twin) = made.take().unwrap();
+        let old_raw = old_host.texture.as_raw() as usize;
+        r.host.current_id.store(0, Relaxed);
+        r.host.trimmed.store(true, Relaxed);
+        r.host.checked_epoch.store(epoch, Relaxed);
+        crate::texture::unstage(this);
+        if let Some(twin) = twin {
+            crate::host::retire(twin);
+        }
+        crate::levels::STATS[4].fetch_add(1, Relaxed);
+        return ResidentSync::Dropped { old_host, old_raw };
+    };
+    if new_first == old_first {
+        r.host.trimmed.store(new_first > 0, Relaxed);
+        r.host.checked_epoch.store(epoch, Relaxed);
+        return ResidentSync::Unchanged;
+    }
+    if new_first < old_first && !allow_grow {
+        return ResidentSync::DeferredGrowth;
+    }
+    let clear = r
+        .host
+        .clear
+        .as_ref()
+        .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
+    let desc = crate::levels::trimmed_desc(&r.desc, new_first, mip_count(&r.desc));
+    let Some(texture) = host_texture(&desc, r.host.state, clear, r.data() as usize) else {
+        return ResidentSync::DeferredGrowth;
+    };
+    let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
+    let mut new_host = HostTexture::new(texture, state);
+    new_host.first_level = new_first;
+    new_host.filled = fills(&r.desc);
+    if new_host.filled {
+        KINDS[0].fetch_add(1, Relaxed);
+        KINDS[1].fetch_add(new_host.bytes, Relaxed);
+    }
+    KINDS[6].fetch_add(1, Relaxed);
+    let new_host = std::sync::Arc::new(new_host);
+    let twin = twin_texture(&r.desc, &new_host.texture);
+    let old_pair = made.replace((new_host.clone(), twin));
+    let (old_host, old_twin) = old_pair.unwrap();
+    let old_raw = old_host.texture.as_raw() as usize;
+    r.host.current_id.store(new_host.id, Relaxed);
+    r.host.trimmed.store(new_first > 0, Relaxed);
+    r.host.checked_epoch.store(epoch, Relaxed);
+    drop(made);
+    if let Some(old_twin) = old_twin {
+        crate::host::retire(old_twin);
+    }
+    crate::texture::unstage(this);
+    if new_first < old_first {
+        crate::levels::STATS[2].fetch_add(1, Relaxed);
+    } else {
+        crate::levels::STATS[3].fetch_add(1, Relaxed);
+    }
+    ResidentSync::Swapped {
+        new_host,
+        old_host,
+        old_raw,
+    }
+}
+
 #[cfg(windows)]
 impl HostTexture {
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
@@ -2394,6 +2637,7 @@ impl HostTexture {
             tiled: None,
             evicted: std::sync::atomic::AtomicBool::new(false),
             evicted_frame: std::sync::atomic::AtomicU64::new(0),
+            first_level: 0,
         }
     }
 
@@ -2415,6 +2659,7 @@ impl HostTexture {
             tiled: Some(tiled),
             evicted: std::sync::atomic::AtomicBool::new(false),
             evicted_frame: std::sync::atomic::AtomicU64::new(0),
+            first_level: 0,
         }
     }
 }
@@ -2895,6 +3140,9 @@ fn hand_out_resource(
             refused: std::sync::atomic::AtomicBool::new(false),
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
+            current_id: std::sync::atomic::AtomicU64::new(0),
+            trimmed: std::sync::atomic::AtomicBool::new(false),
+            checked_epoch: std::sync::atomic::AtomicU64::new(0),
         },
         #[cfg(windows)]
         fsr_output: std::sync::OnceLock::new(),

@@ -308,12 +308,14 @@ pub(crate) fn plan(
     footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT],
     rows: &[u32],
     mips: u32,
+    first_level: u32,
+    tiled_size: u64,
 ) -> Option<Plan> {
     let a = layout.addressing()?;
     if layout.desc.samples != 1 || mips == 0 || footprints.len() != rows.len() {
         return None;
     }
-    let header_offset = u32::try_from(layout.size.next_multiple_of(4)).ok()?;
+    let header_offset = u32::try_from(tiled_size.next_multiple_of(4)).ok()?;
     header_offset.checked_add((HEADER_WORDS * 4) as u32)?;
     let mut header = [0u32; HEADER_WORDS];
     for (axis, flips) in a.flips.iter().enumerate() {
@@ -323,7 +325,8 @@ pub(crate) fn plan(
     let three_d = layout.desc.dimension == Dimension::Tex3d;
     let mut subs = Vec::with_capacity(footprints.len());
     for (i, (fp, &rows)) in footprints.iter().zip(rows).enumerate() {
-        let (mip, slice) = (i as u32 % mips, i as u32 / mips);
+        let (mip_host, slice) = (i as u32 % mips, i as u32 / mips);
+        let mip = mip_host.checked_add(first_level)?;
         let m = layout.mips.get(mip as usize)?;
         let first = if three_d {
             if slice != 0 {
@@ -709,7 +712,7 @@ mod tests {
         let l = Layout::for_gpu(&d, pipes, pbx).unwrap();
         let (fps, rows, total) = footprints(&l);
         let mips = d.mips;
-        let p = plan(&l, &fps, &rows, mips).unwrap_or_else(|| panic!("no plan for {d:?}"));
+        let p = plan(&l, &fps, &rows, mips, 0, l.size).unwrap_or_else(|| panic!("no plan for {d:?}"));
         let tiled = noise(
             l.size as usize,
             u64::from(d.swizzle.0) * 977 + u64::from(d.element_bytes) + u64::from(d.width),
@@ -978,7 +981,7 @@ mod tests {
                     .unwrap();
             }
             let texture = texture.unwrap();
-            let p = plan(&l, &fps, &rows, mips).unwrap_or_else(|| panic!("no plan for {d:?}"));
+            let p = plan(&l, &fps, &rows, mips, 0, l.size).unwrap_or_else(|| panic!("no plan for {d:?}"));
             let tiled = noise(l.size as usize, u64::from(w) * 31 + u64::from(h));
             let src = card.tiled(&tiled, &p);
             let linear = card.buffer(D3D12_HEAP_TYPE_DEFAULT, total, D3D12_RESOURCE_STATE_COMMON);

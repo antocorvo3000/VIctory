@@ -223,9 +223,17 @@ extern "system" fn create_queue(
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
+        scheduler.lock().staging = u64::from(size).max(staging_floor());
     }
     S_OK
+}
+
+/// The least staging the reads may hold at once (`VICTORY_DSTORAGE_STAGING_MB`,
+/// 0 by default: the title's own). The console decompresses in hardware; here
+/// the workers do, and the title's 32 MiB lets only a few of them work at once.
+fn staging_floor() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| std::env::var("VICTORY_DSTORAGE_STAGING_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)) << 20
 }
 
 fn text(name: *const c_char) -> String {
@@ -409,7 +417,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_id: 0,
                     next_seq: 0,
                     staged: 0,
-                    staging: STAGING,
+                    staging: STAGING.max(staging_floor()),
                     starved: false,
                     clock: [0; 3],
                     now: 0,
@@ -514,7 +522,7 @@ fn work(scheduler: &'static Scheduler) {
 }
 
 impl Lanes {
-    /// Counts a finished request; every 5 s a debug line sums them up.
+    /// Counts a finished request; every 5 s a line sums them up.
     fn count(&mut self, job: &Job, started: std::time::Instant) {
         let (requests, bytes, busy) = &mut self.done;
         *requests += 1;
@@ -529,7 +537,7 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
-            tracing::debug!(
+            tracing::info!(
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
                 busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),

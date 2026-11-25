@@ -64,9 +64,16 @@ pub(crate) enum Stage {
     RootHeapBuffers = 24,
     RootTable = 25,
     RootFind = 26,
+    RefreshMaterialize = 27,
+    RefreshWatch = 28,
+    RefreshCopy = 29,
+    AskKernel = 30,
+    AskSettle = 31,
+    WatchView = 32,
+    WatchKernel = 33,
 }
 
-const STAGE_COUNT: usize = 27;
+const STAGE_COUNT: usize = 34;
 
 static CALLS: [AtomicU64; STAGE_COUNT] = [const { AtomicU64::new(0) }; STAGE_COUNT];
 static NS: [AtomicU64; STAGE_COUNT] = [const { AtomicU64::new(0) }; STAGE_COUNT];
@@ -331,6 +338,13 @@ pub(crate) fn log(frames: f64) {
     let (_, snap_ns) = take_stage(Stage::SubmitSnapshots);
     let (_, card_ns) = take_stage(Stage::SubmitCardBefore);
     let (_, prel_ns) = take_stage(Stage::SubmitPrelude);
+    let (mat_cnt, mat_ns) = take_stage(Stage::RefreshMaterialize);
+    let (watch_cnt, watch_ns) = take_stage(Stage::RefreshWatch);
+    let (rcopy_cnt, rcopy_ns) = take_stage(Stage::RefreshCopy);
+    let (_, kernel_ns) = take_stage(Stage::AskKernel);
+    let (_, settle_ns) = take_stage(Stage::AskSettle);
+    let (view_cnt, view_ns) = take_stage(Stage::WatchView);
+    let (kern_cnt, kern_ns) = take_stage(Stage::WatchKernel);
 
     tracing::info!(
         "submit preparing CPU/frame: ask_once {:.2} ms, copy/fill {:.2} ms, refresh {:.2} ms, \
@@ -342,6 +356,21 @@ pub(crate) fn log(frames: f64) {
         ms(snap_ns),
         ms(card_ns),
         ms(prel_ns),
+    );
+    tracing::info!(
+        "submit preparing split per frame: ask_once = asking the kernel {:.2} ms + settles behind flights {:.2} ms;          refresh = copy-backs made first {:.0}: {:.2} ms, write-watch answers {:.0}: {:.2} ms, copying {:.0}: {:.2} ms;          of the answers: views the guards answer {:.0}: {:.2} ms, waits for the journal's writer lock {:.0}: {:.2} ms",
+        ms(kernel_ns),
+        ms(settle_ns),
+        cnt(mat_cnt),
+        ms(mat_ns),
+        cnt(watch_cnt),
+        ms(watch_ns),
+        cnt(rcopy_cnt),
+        ms(rcopy_ns),
+        cnt(view_cnt),
+        ms(view_ns),
+        cnt(kern_cnt),
+        ms(kern_ns),
     );
 }
 

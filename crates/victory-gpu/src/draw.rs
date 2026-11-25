@@ -2879,6 +2879,11 @@ impl State {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
+                    if crate::levels::on()
+                        && let Some(tex) = crate::resource::placed_known(address, &resource)
+                    {
+                        sync_resident_for_resource(list, tex, false);
+                    }
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }
@@ -2942,14 +2947,29 @@ impl State {
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
-                    host.texture_slot_done(index, write, None);
+                    if let Some(View::Shader(res, _)) = view.as_ref()
+                        && crate::resource::has_no_resident_levels(*res as This)
+                    {
+                        host.texture_slot_later(index, write, frame, most);
+                    } else {
+                        host.texture_slot_done(index, write, None);
+                    }
                     continue;
                 }
             };
+            let deferred_growth = sync_resident_for_resource(list, resource, room);
             let title_fills = crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
             if !title_fills {
                 // a render target, a depth or unordered access texture: the host's own
-                host.texture_slot_done(index, write, None);
+                if crate::resource::has_no_resident_levels(resource) {
+                    host.texture_slot_later(index, write, frame, most);
+                } else {
+                    host.texture_slot_done(index, write, None);
+                }
+                continue;
+            }
+            if deferred_growth {
+                host.texture_slot_held(index, write, frame + most);
                 continue;
             }
             let unchanged = crate::texture::unchanged_on_card(resource);
@@ -3981,6 +4001,7 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
+                        sync_resident_for_view(list, &view);
                         host.make_at(index, &view);
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
@@ -4245,6 +4266,7 @@ impl State {
                         host.constant_held(index, gpu, size);
                     }
                     Some(view) => {
+                        sync_resident_for_view(list, &view);
                         if let Some(resource) = host.make_held(index, &view) {
                             self.held.entry(resource.as_raw() as usize).or_insert(resource);
                         }
@@ -4480,6 +4502,7 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
+                        sync_resident_for_view(list, &view);
                         host.make_at(index, &view);
                         let kind = entry_u.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
@@ -5106,6 +5129,52 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
+fn sync_resident_for_resource(list: &HostList, resource: This, allow_grow: bool) -> bool {
+    if !crate::levels::on() || resource.is_null() {
+        return false;
+    }
+    match crate::resource::sync_resident_levels(resource, allow_grow) {
+        crate::resource::ResidentSync::Unchanged => false,
+        crate::resource::ResidentSync::DeferredGrowth => true,
+        crate::resource::ResidentSync::Swapped {
+            new_host,
+            old_host,
+            old_raw,
+        } => {
+            crate::texture::upload(list, resource, &new_host.texture);
+            crate::descriptor::host::swap_texture_views(old_raw);
+            crate::host::retire(old_host);
+            false
+        }
+        crate::resource::ResidentSync::Dropped { old_host, old_raw } => {
+            let targets = std::collections::HashSet::from([old_raw]);
+            crate::descriptor::host::unmake_pinned(&targets);
+            crate::host::retire(old_host);
+            false
+        }
+    }
+}
+
+fn sync_resident_for_view(list: &HostList, view: &View) {
+    if !crate::levels::on() {
+        return;
+    }
+    let resource = match view {
+        View::Shader(r, _) => *r as This,
+        View::Placed(false, resource, desc) if resource[0] != 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let Some(tex) = crate::resource::placed_known(address, resource) else {
+                return;
+            };
+            tex
+        }
+        _ => return,
+    };
+    if crate::resource::needs_resident_sync(resource) {
+        sync_resident_for_resource(list, resource, crate::resource::room_lately());
+    }
+}
+
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -5247,11 +5316,17 @@ fn apply_resolved_readable(list: &HostList, r: &mut ResolvedReadable, copy_gen: 
         let ptr = resource as This;
         let aliased =
             alias_source.is_some_and(|source| crate::texture::alias(list, ptr, source as This));
-        if !aliased
-            && let Some(t) = host_res.as_ref()
-            && crate::texture::title_written(t)
-        {
-            crate::texture::upload(list, ptr, t);
+        if !aliased {
+            let current = if crate::levels::on() {
+                crate::resource::host_resource(ptr)
+            } else {
+                host_res.as_ref()
+            };
+            if let Some(t) = current
+                && crate::texture::title_written(t)
+            {
+                crate::texture::upload(list, ptr, t);
+            }
         }
         list.twin_use(ptr, false, false);
         let (tested, _) = TESTED_DEPTH.get();

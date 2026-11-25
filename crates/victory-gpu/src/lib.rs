@@ -38,6 +38,8 @@ mod copyback;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod levels;
 pub mod list;
 pub mod object;
 pub mod pipeline;

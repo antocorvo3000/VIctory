@@ -6054,7 +6054,9 @@ impl Host {
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let asking = crate::record_timing::start();
             crate::watch::ask_once(&ranges);
+            crate::record_timing::add_since(crate::record_timing::Stage::AskKernel, asking);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
@@ -6065,6 +6067,7 @@ impl Host {
                     let settling = std::time::Instant::now();
                     self.settle_stale(&mut submitted, runs, &stale, || crate::watch::ask_once(&ranges));
                     settled += settling.elapsed();
+                    crate::record_timing::add(crate::record_timing::Stage::AskSettle, settling.elapsed().as_nanos() as u64);
                 }
             }
         } else if behind {
@@ -6681,7 +6684,9 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         if crate::draw::table_cache() && !resource.is_null() {
             let mut rstates = self.resource_states.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((copy, flags, last)) = rstates.get_mut(&(resource as usize)) {
+            if let Some((copy, flags, last)) = rstates.get_mut(&(resource as usize))
+                && (!crate::levels::on() || crate::resource::is_host_current(resource, copy.id))
+            {
                 let wanted = legal_for(*flags, wanted);
                 if *last == wanted {
                     return None;
@@ -7587,7 +7592,7 @@ impl HostList {
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
-/// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
+/// a copy to a thread (on by default; `VICTORY_WIDE_REFRESH=0` turns it off).
 ///
 /// A submission brings some sixty copies up to date, one after the other
 /// on the submitting thread: for each, the pages the title wrote are asked
@@ -7600,7 +7605,7 @@ impl HostList {
 /// they are for the title's threads.
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_none_or(|v| v != "0"))
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the

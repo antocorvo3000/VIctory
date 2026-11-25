@@ -1201,7 +1201,7 @@ const NOT_WATCHED: u8 = 2;
 /// sent up, are left out by mode 1.)
 fn copy_diff() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| std::env::var("VICTORY_COPY_DIFF").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+    *MODE.get_or_init(|| std::env::var("VICTORY_COPY_DIFF").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
 }
 
 /// [`copy_diff`]'s mode `mode` for a copy (`card`: in the card's memory).
@@ -3327,7 +3327,9 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        let materializing = crate::record_timing::start();
         crate::copyback::materialize_for_shadow_update(self.id, from, to, true);
+        crate::record_timing::add_since(crate::record_timing::Stage::RefreshMaterialize, materializing);
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -3360,9 +3362,14 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            let asking = crate::record_timing::start();
+            let answer = crate::watch::writes(from, to, true);
+            crate::record_timing::add_since(crate::record_timing::Stage::RefreshWatch, asking);
+            if let Some((now, written)) = answer {
                 self.watched.store(1, Ordering::Relaxed);
+                let copying = crate::record_timing::start();
                 let copied = self.copy_stale(from, to, now, &written);
+                crate::record_timing::add_since(crate::record_timing::Stage::RefreshCopy, copying);
                 COPY_STATS[1].fetch_add((to - from) as u64, Ordering::Relaxed);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]

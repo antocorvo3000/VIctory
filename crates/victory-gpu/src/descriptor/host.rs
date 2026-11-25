@@ -212,6 +212,25 @@ pub(crate) fn unmake_pinned(targets: &std::collections::HashSet<usize>) -> u64 {
     unmade
 }
 
+/// Rebuilds every persistent descriptor slot across live shader-visible view
+/// heaps that currently pins `old_raw`, swapping its view to the texture's
+/// current host copy and retiring the old resource reference.
+pub(crate) fn swap_texture_views(old_raw: usize) -> u64 {
+    if old_raw == 0 {
+        return 0;
+    }
+    let heaps: Vec<std::sync::Arc<HostHeap>> = {
+        let mut list = VIEW_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        list.retain(|w| w.strong_count() > 0);
+        list.iter().filter_map(std::sync::Weak::upgrade).collect()
+    };
+    let mut swapped = 0u64;
+    for heap in heaps {
+        swapped += heap.remake_slots_for_resource(old_raw);
+    }
+    swapped
+}
+
 struct KeptSlots {
     slots: Vec<Option<ID3D12Resource>>,
     /// Reverse index for persistent slots (`index < count`): raw COM pointer ->
@@ -557,6 +576,14 @@ pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
 /// two frames on takes those of the next frame with it.
 const PAGE_WRITE_AFTER: u64 = 2;
 
+/// Bumped whenever [`remapped`] or [`page_written`] observes a memory change
+/// so `VICTORY_RESIDENT_LEVELS=1` can skip re-probing pages when nothing changed.
+static REMAP_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn remap_epoch() -> u64 {
+    REMAP_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The bytes of a write the guards do not see are in title memory `[at,
 /// at + len)`: the placed textures there changed with no descriptor
 /// written and nothing mapped. Kept for the next texture pass
@@ -570,6 +597,7 @@ pub(crate) fn page_written(at: usize, len: usize) {
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
+    REMAP_EPOCH.fetch_add(1, Relaxed);
     let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
     if let Some(last) = ranges.last_mut()
@@ -632,6 +660,9 @@ pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
     /// Ranges kept until a pass takes them.
     const MOST: usize = 1 << 20;
+    if len > 0 {
+        REMAP_EPOCH.fetch_add(1, Relaxed);
+    }
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
@@ -2625,6 +2656,60 @@ impl HostHeap {
         unmade
     }
 
+    /// Rebuilds every persistent slot (`< count`) currently pinning `old_raw`
+    /// from its recorded title view, swapping it to the texture's new host copy
+    /// and retiring the old resource reference.
+    pub(crate) fn remake_slots_for_resource(&self, old_raw: usize) -> u64 {
+        if self.sampler || old_raw == 0 {
+            return 0;
+        }
+        let targets = std::collections::HashSet::from([old_raw]);
+        let mut candidates = Vec::new();
+        for shard in &self.kept {
+            candidates.extend(
+                shard
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .slots_for(&targets),
+            );
+        }
+        if candidates.is_empty() {
+            return 0;
+        }
+        let mut swapped = 0u64;
+        for index in candidates {
+            let s = slot_shard(index);
+            let local = slot_local(index);
+            let mut made = crate::record_timing::lock_timed(&self.made[s]);
+            let still_old = self.kept[s]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(index)
+                .is_some_and(|r| windows::core::Interface::as_raw(r) as usize == old_raw);
+            if !still_old {
+                continue;
+            }
+            let key = made.get(local).copied().unwrap_or(0);
+            if key == 0 {
+                continue;
+            }
+            let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
+                continue;
+            };
+            let kept = make(&view, self.cpu(index));
+            if kept.is_none() {
+                null_for(&view, self.cpu(index));
+                made[local] = 0;
+                if let Some(mk) = self.made_keys.get(index as usize) {
+                    mk.store(0, std::sync::atomic::Ordering::Release);
+                }
+            }
+            self.keep(index, kept.flatten());
+            swapped += 1;
+        }
+        swapped
+    }
+
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
     /// of `buffer` from byte `offset` (a multiple of 16): a root SRV with a
     /// size, whose reads past it return zeros instead of reaching whatever
@@ -2958,13 +3043,16 @@ impl HostHeap {
                 {
                     KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
-                    let next_key = if later { 0 } else { key };
-                    made[local] = next_key;
                     let kept = if later {
                         None
                     } else {
                         make(&view, self.cpu(index))
                     };
+                    let unmapped_skip = !later
+                        && kept.is_none()
+                        && has_no_resident_levels_view(&view);
+                    let next_key = if later || unmapped_skip { 0 } else { key };
+                    made[local] = next_key;
                     if kept.is_none() && !self.sampler {
                         null_for(&view, self.cpu(index));
                     }
@@ -4102,12 +4190,24 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         _ => {}
                     }
                 }
+                // Resident levels (`VICTORY_RESIDENT_LEVELS=1`): shift the view
+                // from title mip space onto the host resource whose mip 0 is
+                // `first_level`.
+                let first_level = crate::resource::host_first_level(resource);
+                if first_level > 0
+                    && let Some(d) = desc.as_mut()
+                {
+                    // SAFETY: a live resource.
+                    let own = unsafe { texture.GetDesc() };
+                    crate::levels::shift_srv_desc(d, first_level, u32::from(own.MipLevels));
+                }
                 // Levels on demand (`crate::tiles`): a texture made level by
                 // level is shown from the first level that is the title's
                 // and has memory, if the title's view starts before it (a
                 // level without memory reads zeros: a black texture). The
                 // title's own view mostly starts there already.
-                if let Some(first) = crate::resource::first_shown(resource)
+                if first_level == 0
+                    && let Some(first) = crate::resource::first_shown(resource)
                     && first > 0
                 {
                     // SAFETY: a live resource.
@@ -4302,6 +4402,24 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     match (a, b) {
         (View::Placed(false, resource, desc), View::Placed(false, other, other_desc)) => {
             resource[0] != 1 && resource == other && desc[10..12] == other_desc[10..12]
+        }
+        _ => false,
+    }
+}
+
+/// Whether `view` names a title texture whose levels are currently unmapped
+/// under `VICTORY_RESIDENT_LEVELS=1` (so a null slot must not be cached as
+/// made).
+fn has_no_resident_levels_view(view: &View) -> bool {
+    if !crate::levels::on() {
+        return false;
+    }
+    match view {
+        View::Shader(r, _) => crate::resource::has_no_resident_levels(*r as crate::object::This),
+        View::Placed(false, resource, desc) if resource[0] != 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            crate::resource::placed_known(address, resource)
+                .is_some_and(crate::resource::has_no_resident_levels)
         }
         _ => false,
     }

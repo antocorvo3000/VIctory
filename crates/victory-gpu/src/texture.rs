@@ -134,6 +134,10 @@ pub(crate) struct Staging {
     layout: victory_formats::texture::Layout,
     /// Total bytes of the console layout across all planes.
     tiled_size: u64,
+    /// Resident bytes of the console layout read for `first_level..`.
+    resident_size: u64,
+    /// Title mip level mapped to host mip `0`.
+    first_level: u32,
     /// Mips per array slice, and subresources per plane (`mips * slices`).
     mips: u32,
     plane_subs: u32,
@@ -860,7 +864,12 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+    let use_key = if crate::levels::on() {
+        windows::core::Interface::as_raw(texture) as usize
+    } else {
+        resource as usize
+    };
+    if host_written || !list.first_use(use_key) {
         return;
     }
     let current_host_id = crate::resource::host_id(resource).unwrap_or(0);
@@ -1490,7 +1499,7 @@ pub(crate) fn unchanged_on_card(resource: This) -> bool {
                 return false;
             }
             let mut inner = s.history.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let (_, changed) = check_memory_changed(s.memory, s.tiled_size as usize, &mut inner.last, false, s.gpu.is_some(), None, |_| {});
+            let (_, changed) = check_memory_changed(s.memory, s.resident_size as usize, &mut inner.last, false, s.gpu.is_some(), None, |_| {});
             if changed {
                 inner.dirty = true;
                 inner.rewrites = inner.rewrites.saturating_add(1);
@@ -1611,7 +1620,7 @@ impl Staging {
     }
 
     fn refresh_timed(&self) -> usize {
-        let size = self.tiled_size as usize;
+        let size = self.resident_size as usize;
         crate::copyback::materialize_range(
             self.memory as usize,
             size,
@@ -1676,7 +1685,7 @@ impl Staging {
         self.dirty.store(true, Relaxed);
         let held = self.judge_held(judged_out);
         if let Some(g) = &self.gpu {
-            let len = tiled.len().min(self.tiled_size as usize);
+            let len = tiled.len().min(self.resident_size as usize);
             if tiled.as_ptr() != self.data.cast_const() {
                 ON_CARD[1].fetch_add(1, Relaxed);
                 // SAFETY: the staging buffer holds `tiled_size` bytes before
@@ -1723,7 +1732,8 @@ impl Staging {
             } else {
                 (i - self.plane_subs as usize, true)
             };
-            let (mip, slice) = (plane_sub as u32 % self.mips, plane_sub as u32 / self.mips);
+            let (mip_host, slice) = (plane_sub as u32 % self.mips, plane_sub as u32 / self.mips);
+            let mip = mip_host + self.first_level;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let max_len = (self.bytes as usize).saturating_sub(footprint.Offset as usize);
@@ -1732,7 +1742,7 @@ impl Staging {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
-            if mip < 32 && held & (1 << mip) == 0 {
+            if mip_host < 32 && held & (1 << mip_host) == 0 {
                 // Not the title's: zeros, not what lies in that memory.
                 linear.fill(0);
                 continue;
@@ -2093,6 +2103,7 @@ fn staging(resource: This, texture: &ID3D12Resource, host_id: u64) -> Option<Arc
     // Asked before the table is locked: the sweep lets go of a staging
     // buffer with its texture's host side locked, in that order.
     let on_demand = crate::resource::host_tiled(resource).is_some();
+    let first_level = crate::resource::host_first_level(resource);
     let history = history_for(resource as usize);
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
@@ -2135,6 +2146,11 @@ fn staging(resource: This, texture: &ID3D12Resource, host_id: u64) -> Option<Arc
         && matches!(d.Format.0, 19 | 20 | 44 | 45))
     .then(|| (tex_layout.planes[1].offset, tex_layout.planes[1].layout.clone()));
     let tiled_size = if stencil.is_some() { tex_layout.size } else { layout.size };
+    let resident_size = if stencil.is_some() {
+        tex_layout.size
+    } else {
+        crate::levels::resident_tiled_size(&layout, first_level)
+    };
     let count = plane_subs * if stencil.is_some() { 2 } else { 1 };
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
@@ -2160,7 +2176,7 @@ fn staging(resource: This, texture: &ID3D12Resource, host_id: u64) -> Option<Arc
     // staging buffer takes the tiled memory and the pattern tables, the
     // card's buffer the subresources. Else on the CPU.
     let on_card = (crate::detile::on() && stencil.is_none() && crate::detile::detiler().is_some())
-        .then(|| crate::detile::plan(&layout, &footprints, &rows, u32::from(d.MipLevels)))
+        .then(|| crate::detile::plan(&layout, &footprints, &rows, u32::from(d.MipLevels), first_level, resident_size))
         .flatten()
         .and_then(|plan| {
             let (linear, cap) = crate::detile::take_linear(total)?;
@@ -2213,12 +2229,12 @@ fn staging(resource: This, texture: &ID3D12Resource, host_id: u64) -> Option<Arc
             inner.dirty = true;
             inner.detiled = 0;
             inner.judged = [0, 0];
-            if !keep_hash_on() {
+            if !keep_hash_on() || crate::levels::on() {
                 inner.last = Last::default();
             }
         }
         inner.memory = memory as usize;
-        inner.size = tiled_size as usize;
+        inner.size = resident_size as usize;
         inner.on_demand = on_demand;
         inner.on_card = on_card.is_some();
         (inner.detiled, inner.uploaded_once && !inner.dirty)
@@ -2232,6 +2248,8 @@ fn staging(resource: This, texture: &ID3D12Resource, host_id: u64) -> Option<Arc
         rows,
         layout,
         tiled_size,
+        resident_size,
+        first_level,
         mips: u32::from(d.MipLevels),
         plane_subs,
         stencil,
