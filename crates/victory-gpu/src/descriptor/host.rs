@@ -620,7 +620,10 @@ impl HostHeap {
             // when a draw reads them through a table: a host texture (and a
             // staging copy) for each of the ~20,000 the title has views of
             // ran the host out of memory (run b2).
-            let later = !for_draw && is_placed_texture(&view);
+            // Local experiment: VICTORY_HEAP_PLACED_TEXTURES=1 makes them
+            // at once, for shaders that index the heap (materials whose
+            // albedo came out black: their textures were null slots).
+            let later = !for_draw && is_placed_texture(&view) && !heap_placed_textures();
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
                 None
@@ -1172,6 +1175,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
 }
 
 /// Whether `view` is a view of a texture the title placed in memory itself.
+fn heap_placed_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_HEAP_PLACED_TEXTURES").is_ok_and(|v| v == "1"))
+}
+
 fn is_placed_texture(view: &View) -> bool {
     matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
 }
