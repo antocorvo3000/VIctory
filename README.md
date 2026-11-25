@@ -16,6 +16,11 @@ decrypts anything or works around any protection, and no game files are included
 | Stability | 17 min in the world without a crash or device removal |
 | Memory | about 28 GB committed |
 
+Screenshots from my RX 6800 XT (prologue, Series X mode, 2-3 fps shown in the window title):
+
+![The cell at sunset, by the window](docs/screenshots/cell-window.png)
+![The cell, sunlight on the wall](docs/screenshots/cell-sink.png)
+
 Still wrong: low frame rate (CPU and GPU still wait for each other: being worked on); areas lit only by the
 title's ray-traced light stay dark (its structure builders are not run yet).
 
